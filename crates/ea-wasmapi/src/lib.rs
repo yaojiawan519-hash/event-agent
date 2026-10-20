@@ -179,6 +179,36 @@ impl Client {
         }
     }
 
+    /// 阻塞读取下一条入站消息，超时返回 `None`（供非阻塞节拍轮询，如 task-thermostat）。
+    pub fn next_timeout(&mut self, timeout: Duration) -> Option<Incoming> {
+        if let Some(m) = self.inbox.pop_front() {
+            return Some(m);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.read_line(Some(deadline)) {
+                Ok(Some(line)) => {
+                    let msg: Message = match serde_json::from_str(line.trim_end()) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    match msg {
+                        Message::Notification(n) => {
+                            return Some(Incoming::Event { method: n.method, params: n.params });
+                        }
+                        Message::Request(r) => {
+                            return Some(Incoming::Request { id: r.id, method: r.method, params: r.params });
+                        }
+                        Message::Response(_) => continue,
+                    }
+                }
+                Ok(None) => return None,
+                Err(e) if e.kind() == ErrorKind::TimedOut => return None,
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// 回复一个请求。
     pub fn reply(&mut self, id: &str, result: Value) -> Result<(), Error> {
         let r = Message::Response(Response {

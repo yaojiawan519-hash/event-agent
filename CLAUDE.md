@@ -21,8 +21,11 @@
 - **heartbeat 掉线判定**：§8.4 除 ping 软挂检测外，另按注册表差分（进程从注册表消失即发 down），确保「杀进程 15 s 内 down」。
 - **ea-sysapi `Client::next(&self)`**：为支持多任务共享（web 同时跑总线接收循环与 HTTP handler），`next` 由 `&mut self` 改为 `&self`（内部 `Mutex<Receiver>`）。
 - **`serve(handler)` 与自动重连推迟**：§7 的这两项留到 M2/M3；M1 三个进程在各自 `tokio::select!` 事件循环里内联处理入站请求（`client.next()` + `client.reply()`），行为等价。
-- **runtime 规则 M2 硬编码**：§8.6 的「按 `rules.json` 顺序匹配」推迟到 M4 挂载 config 目录时读取；M2 把默认规则（low-temp-heat / high-temp-cool / cleared + ignore 列表）以常量数组硬编码在 `crates/runtime/src/main.rs`，行为与 `rules.json` 一致。
+- **runtime 规则：默认硬编码 + `--rules` 加载**：§8.6 的「按 `rules.json` 顺序匹配」——M2 把默认规则（low-temp-heat / high-temp-cool / cleared + ignore 列表）以常量数组硬编码在 `crates/runtime/src/main.rs`；M3 增加 `--rules <path>` 从文件加载（WASI fs 读，`wasmedge --dir <parent>` 预打开目录），默认规则作兜底。`when.data.level` 兼容字面点号键与嵌套 `{data:{level}}` 两种写法。
 - **`event.runtime.decision` 额外带 `rule` 字段**：§8.6 只定义 `{event_method, mode, actions}`，实现额外写 `rule`（命中的规则 id）便于观测，属增量字段。
+- **M3 LLM 测试用 mock 端点**：`llm-gw` 走真实 OpenAI 兼容 HTTP（reqwest，`--config` 指向端点）；`crates/bus/tests/m3.rs` 内置进程内 mock（`/chat/completions`）替代真实 LLM，避免测试依赖外部 key/网络。config 模板 `config/config.json.example`，真实 `config/config.json` 已 gitignore。
+- **LLM 工具 = 已登记 `action.*` + 虚拟 `task.start`**：§8.6 的 `task.start {task,params}` 映射到 `action.task.start`；仅执行 `sys.registry.actions` 里登记过的方法（`task.start` 虚拟例外），未登记的一律拒绝。多轮上限 5，工具结果以 `tool` 角色回填。
+- **规则 `explain:true` 触发 LLM 一句中文说明**：命中规则执行 `then` 后额外经 `sys.llm.chat` 生成一句解释、以 `action.chat.reply` 发出；无 llm-gw provider 时静默跳过（M2 仍通过）。
 
 ## 设备事实（2026-10-20 实测）
 
@@ -37,5 +40,5 @@
 - [x] M0 协议与总线（ea-proto / bus / ea-sysapi）
 - [x] M1 最小闭环（hw-temp / web / heartbeat）
 - [x] M2 运行时 + 规则（ea-wasmapi / runtime）
-- [ ] M3 LLM + 任务进程（llm-gw / task-thermostat）
+- [x] M3 LLM + 任务进程（llm-gw / task-thermostat）
 - [ ] M4 Docker + WasmEdge 部署

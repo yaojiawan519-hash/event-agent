@@ -10,9 +10,11 @@ export PATH="$HOME/.wasmedge/bin:$PATH"
 echo "== 编译原生 workspace =="
 cargo build --workspace
 
-echo "== 编译 runtime.wasm（wasm32-wasip1）=="
+echo "== 编译 wasm 模块（wasm32-wasip1）=="
 rustup run beta cargo build --target wasm32-wasip1 --release \
   --manifest-path crates/runtime/Cargo.toml
+rustup run beta cargo build --target wasm32-wasip1 --release \
+  --manifest-path crates/task-thermostat/Cargo.toml
 
 echo "== 运行全部集成测试 =="
 cargo test --workspace -- --nocapture
