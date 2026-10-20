@@ -2,7 +2,7 @@
   "llm": {
     "api_url": "https://api.deepseek.com/v1",
     "api_key": "",
-    "model": "DeepSeek_V4_pro",
+    "model": "deepseek-v4-pro",
     "timeout_s": 60,
     "temperature": 0.2,
     "max_tokens": 1024

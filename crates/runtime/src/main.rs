@@ -7,6 +7,7 @@
 //! 规则默认硬编码；`--rules <path>` 可加载 `rules.json` 覆盖（M4 挂载 config 目录时用）。
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use ea_proto::{action, event, method, ActionSpec};
 use ea_wasmapi::{Client, Incoming};
@@ -19,6 +20,8 @@ const DEFAULT_IGNORE: &[&str] = &[
 ];
 const EVENT_WINDOW: usize = 20;
 const MAX_ROUNDS: u32 = 5;
+/// LLM 推理调用超时（对齐 llm-gw 的上游 60 s 超时；真实大模型偶发 >5 s，用默认 5 s 会误判为不可用）。
+const LLM_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Rule {
     id: String,
@@ -158,7 +161,7 @@ fn llm_decide(rt: &mut Runtime, m: &str, data: &Value) {
     let mut final_text = String::new();
 
     for _ in 0..rt.max_rounds {
-        let resp = match rt.client.call(method::SYS_LLM_CHAT, json!({"messages": messages, "tools": tools})) {
+        let resp = match rt.client.call_timeout(method::SYS_LLM_CHAT, json!({"messages": messages, "tools": tools}), LLM_TIMEOUT) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[runtime] llm_chat 失败: {e:?}");
@@ -174,7 +177,32 @@ fn llm_decide(rt: &mut Runtime, m: &str, data: &Value) {
             break;
         }
         // 追加 assistant 消息（含 tool_calls），再逐个执行工具并追加 tool 结果。
-        messages.push(json!({"role": "assistant", "content": content, "tool_calls": tool_calls}));
+        // llm-gw 归一化后的 tool_calls 是 {id,name,arguments(Value)}，回填给上游须还原为
+        // OpenAI 原生结构 {id,type:"function",function:{name,arguments(字符串)}}，
+        // 否则 DeepSeek 报 `missing field 'type'`。
+        let echo_calls: Vec<Value> = tool_calls
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|tc| {
+                        let args = tc.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                        let args_str = match args {
+                            Value::String(s) => s,
+                            v => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
+                        };
+                        json!({
+                            "id": tc.get("id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": {
+                                "name": tc.get("name").cloned().unwrap_or(Value::Null),
+                                "arguments": args_str,
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        messages.push(json!({"role": "assistant", "content": content, "tool_calls": echo_calls}));
         if let Some(arr) = tool_calls.as_array() {
             for tc in arr {
                 let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -216,7 +244,7 @@ fn explain_rule(rt: &mut Runtime, event_method: &str, rule_id: &str, data: &Valu
         ],
         "tools": []
     });
-    if let Ok(resp) = rt.client.call(method::SYS_LLM_CHAT, req) {
+    if let Ok(resp) = rt.client.call_timeout(method::SYS_LLM_CHAT, req, LLM_TIMEOUT) {
         if let Some(text) = resp.get("content").and_then(|v| v.as_str()) {
             let _ = rt.client.call(action::CHAT_REPLY, json!({"session": session, "text": text}));
         }
@@ -238,10 +266,10 @@ fn system_prompt(rt: &Runtime) -> String {
     let mut s = String::from("你是事件驱动智能体，根据事件决定对温度环境执行的操作。可用操作：\n");
     for a in &rt.actions {
         if a.method.starts_with("action.") && a.method != action::CHAT_REPLY {
-            s.push_str(&format!("- {}：{}\n", a.method, a.description));
+            s.push_str(&format!("- {}：{}\n", tool_name(&a.method), a.description));
         }
     }
-    s.push_str("- task.start：启动异步任务（如 hold_temp 恒温）\n");
+    s.push_str("- task_start：启动异步任务（如 hold_temp 恒温）\n");
     s.push_str("收到事件后用 tool_calls 调用相应操作；完成后用简短中文说明你做了什么。");
     s
 }
@@ -252,14 +280,14 @@ fn build_tools(rt: &Runtime) -> Value {
         if a.method.starts_with("action.") && a.method != action::CHAT_REPLY {
             tools.push(json!({
                 "type": "function",
-                "function": {"name": a.method, "description": a.description, "parameters": a.params_schema}
+                "function": {"name": tool_name(&a.method), "description": a.description, "parameters": a.params_schema}
             }));
         }
     }
     tools.push(json!({
         "type": "function",
         "function": {
-            "name": "task.start",
+            "name": tool_name("task.start"),
             "description": "启动异步任务（如 hold_temp 恒温）",
             "parameters": json!({"type":"object","properties":{"task":{"type":"string"},"target":{"type":"number"},"hysteresis":{"type":"number"}}})
         }
@@ -267,12 +295,18 @@ fn build_tools(rt: &Runtime) -> Value {
     json!(tools)
 }
 
+/// LLM 工具名 = 总线方法名的「点 → 下划线」形式（DeepSeek 等 OpenAI 兼容端点要求工具名匹配 `^[a-zA-Z0-9_-]+$`，不能含 `.`）。
+fn tool_name(method: &str) -> String {
+    method.replace('.', "_")
+}
+
 fn resolve_action(rt: &Runtime, name: &str) -> (String, bool) {
-    if name == "task.start" {
+    // name 是 sanitized 工具名，反查真实总线方法名。
+    if name == tool_name("task.start") {
         return (action::TASK_START.to_string(), true);
     }
-    if rt.actions.iter().any(|a| a.method == name) {
-        return (name.to_string(), true);
+    if let Some(a) = rt.actions.iter().find(|a| tool_name(&a.method) == name) {
+        return (a.method.clone(), true);
     }
     (name.to_string(), false)
 }

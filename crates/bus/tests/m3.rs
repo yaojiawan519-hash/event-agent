@@ -176,7 +176,7 @@ fn mock_response(body: &Value) -> Value {
         return json!({
             "choices":[{"message":{"role":"assistant","content":null,
                 "tool_calls":[{"id":"call_1","type":"function",
-                    "function":{"name":"task.start","arguments":"{\"task\":\"hold_temp\",\"target\":25.0,\"hysteresis\":1.0}"}}]}}],
+                    "function":{"name":"task_start","arguments":"{\"task\":\"hold_temp\",\"target\":25.0,\"hysteresis\":1.0}"}}]}}],
             "usage":{"total_tokens":42}
         });
     }
@@ -184,7 +184,7 @@ fn mock_response(body: &Value) -> Value {
         return json!({
             "choices":[{"message":{"role":"assistant","content":null,
                 "tool_calls":[{"id":"call_1","type":"function",
-                    "function":{"name":"action.heater.start","arguments":"{}"}}]}}],
+                    "function":{"name":"action_heater_start","arguments":"{}"}}]}}],
             "usage":{"total_tokens":42}
         });
     }
