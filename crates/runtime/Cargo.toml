@@ -1,0 +1,16 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2021"
+
+# 独立于父 workspace：本 crate 仅面向 wasm32-wasip1，构建为 runtime.wasm。
+[workspace]
+
+[[bin]]
+name = "runtime"
+path = "src/main.rs"
+
+[dependencies]
+ea-proto = { path = "../ea-proto" }
+ea-wasmapi = { path = "../ea-wasmapi" }
+serde_json = "1"

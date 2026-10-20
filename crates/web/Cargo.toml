@@ -1,0 +1,14 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+ea-proto = { path = "../ea-proto" }
+ea-sysapi = { path = "../ea-sysapi" }
+futures-util = "0.3"
+serde_json = "1.0.154"
+tokio = { version = "1.54.0", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

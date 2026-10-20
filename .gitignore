@@ -1,0 +1,6 @@
+/target
+crates/*/target/
+**/*.rs.bk
+config/config.json
+data/
+.DS_Store

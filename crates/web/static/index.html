@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>事件驱动智能体 · 温度告警演示</title>
+<style>
+  :root {
+    --bg: #f1f5f9;
+    --panel: #ffffff;
+    --border: #e2e8f0;
+    --fg: #1e293b;
+    --muted: #64748b;
+    --accent: #2563eb;
+    --accent-soft: #eff6ff;
+    --alarm: #dc2626;
+    --alarm-soft: #fef2f2;
+    --ok: #16a34a;
+    --ok-soft: #f0fdf4;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  #conn-badge { margin-left: auto; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .badge.ok { background: var(--ok-soft); color: var(--ok); }
+  .badge.alarm { background: var(--alarm-soft); color: var(--alarm); }
+  .badge.accent { background: var(--accent-soft); color: var(--accent); }
+  .badge.muted { background: #f1f5f9; color: var(--muted); }
+
+  main {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 280px 1fr 380px;
+    gap: 12px;
+    padding: 12px;
+  }
+  .col {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .col > h2 {
+    margin: 0;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    border-bottom: 1px solid var(--border);
+    flex: none;
+  }
+  .col-body { flex: 1; overflow-y: auto; padding: 12px; }
+
+  /* 左栏：控制树 */
+  .tnode .tbody { display: none; margin-left: 14px; border-left: 1px solid var(--border); padding-left: 10px; }
+  .tnode.open > .tbody { display: block; }
+  .thead {
+    cursor: pointer;
+    padding: 7px 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .thead:hover { background: #f8fafc; }
+  .arrow { color: var(--muted); font-size: 11px; width: 12px; }
+  .trow { display: flex; align-items: center; gap: 8px; padding: 6px 8px; font-size: 13px; }
+  .tlabel { flex: 1; color: var(--muted); }
+  .hint { font-size: 11px; color: var(--muted); padding: 0 8px 8px; line-height: 1.4; }
+
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; cursor: pointer; inset: 0;
+    background: #cbd5e1; border-radius: 22px; transition: .2s;
+  }
+  .slider::before {
+    content: ""; position: absolute; height: 16px; width: 16px;
+    left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(18px); }
+
+  button {
+    border: 1px solid var(--border); background: #fff; color: var(--fg);
+    border-radius: 8px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { background: #f8fafc; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { background: #1d4ed8; }
+  button.block { width: 100%; }
+  input[type=number] {
+    width: 100%; border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 8px; font-size: 13px; font-family: inherit;
+  }
+
+  /* 中栏：仪表盘 */
+  .temp-card { text-align: center; padding: 12px 0 4px; }
+  .temp-value { font-size: 60px; font-weight: 700; line-height: 1.05; }
+  .temp-unit { font-size: 22px; color: var(--muted); font-weight: 400; margin-left: 2px; }
+  .temp-label { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+  .stat-row { display: flex; gap: 8px; margin: 14px 0; }
+  .stat {
+    flex: 1; background: #f8fafc; border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px; text-align: center;
+  }
+  .stat .k { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .stat .v { font-size: 15px; font-weight: 600; }
+
+  #alarm-banner {
+    display: none; align-items: center; gap: 8px;
+    background: var(--alarm-soft); border: 1px solid var(--alarm); color: var(--alarm);
+    border-radius: 10px; padding: 10px 12px; margin: 8px 0;
+    font-size: 14px; font-weight: 600;
+  }
+
+  .section-title {
+    font-size: 12px; color: var(--muted); margin: 16px 0 6px;
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  #proc-list { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .chip.up { background: var(--ok-soft); color: var(--ok); }
+  .chip.down { background: var(--alarm-soft); color: var(--alarm); }
+
+  #event-log { display: flex; flex-direction: column; gap: 4px; }
+  .evt { font-size: 12px; color: var(--muted); padding: 5px 8px; background: #f8fafc; border-radius: 6px; }
+  .evt.alarm { background: var(--alarm-soft); color: var(--alarm); font-weight: 600; }
+  .evt.ok { background: var(--ok-soft); color: var(--ok); }
+  .muted { color: var(--muted); }
+
+  /* 右栏：AI 对话框 */
+  #chat-log { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .msg {
+    max-width: 85%; padding: 8px 12px; border-radius: 12px;
+    font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+  }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.reply { align-self: flex-start; background: #f1f5f9; border-bottom-left-radius: 4px; }
+  .msg.alarm { align-self: flex-start; background: var(--alarm-soft); color: var(--alarm); border: 1px solid var(--alarm); }
+  .msg.system { align-self: center; background: #f8fafc; color: var(--muted); font-size: 12px; }
+
+  .chat-foot { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); flex: none; }
+  #chat-input {
+    flex: 1; border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 14px; resize: none; font-family: inherit;
+  }
+  #chat-send { background: var(--accent); border-color: var(--accent); color: #fff; padding: 0 18px; font-weight: 600; }
+  #chat-send:disabled { opacity: .5; cursor: default; }
+
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; }
+    #left, #right { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>事件驱动智能体 · 温度告警演示</h1>
+  <span id="conn-badge" class="badge alarm">连接中…</span>
+</header>
+
+<main>
+  <!-- 左栏：控制参数属性选择树 -->
+  <aside class="col" id="left">
+    <h2>控制面板</h2>
+    <div class="col-body">
+      <div class="tnode open">
+        <div class="thead" data-toggle><span class="arrow">▾</span>温度控制</div>
+        <div class="tbody">
+          <div class="trow">
+            <span class="tlabel">加热器</span>
+            <label class="switch"><input type="checkbox" id="heater-switch"><span class="slider"></span></label>
+          </div>
+          <div class="tnode open">
+            <div class="thead" data-toggle><span class="arrow">▾</span>环境温度</div>
+            <div class="tbody">
+              <div class="trow">
+                <input type="number" id="ambient-input" step="0.5" placeholder="固定值 ℃">
+                <button class="primary" id="ambient-set">固定</button>
+              </div>
+              <div class="trow">
+                <button class="block" id="ambient-resume">恢复正弦摆动</button>
+              </div>
+            </div>
+          </div>
+          <div class="trow">
+            <button class="block" id="read-temp">读取当前温度</button>
+          </div>
+          <div class="hint">加热器是唯一热源：开→升温、关→降温；环境只作冷源（-8..20 ℃ 正弦）。固定冷环境即触发低温告警。</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中栏：仪表盘 -->
+  <section class="col" id="center">
+    <h2>仪表盘</h2>
+    <div class="col-body">
+      <div class="temp-card">
+        <div class="temp-label">当前温度</div>
+        <div class="temp-value"><span id="temp-value">--</span><span class="temp-unit">℃</span></div>
+        <div style="margin-top:8px;"><span id="temp-state" class="badge muted">正常</span></div>
+      </div>
+      <div class="stat-row">
+        <div class="stat"><div class="k">加热器</div><div class="v" id="heater-badge">--</div></div>
+        <div class="stat"><div class="k">告警</div><div class="v" id="alarm-badge">正常</div></div>
+        <div class="stat"><div class="k">在线进程</div><div class="v" id="proc-count">0</div></div>
+      </div>
+      <div id="alarm-banner"><span>⚠️</span><span id="alarm-banner-text"></span></div>
+      <div class="section-title">进程状态</div>
+      <div id="proc-list"><span class="muted">无</span></div>
+      <div class="section-title">最近事件</div>
+      <div id="event-log"></div>
+    </div>
+  </section>
+
+  <!-- 右栏：AI 对话框 -->
+  <aside class="col" id="right">
+    <h2>AI 对话</h2>
+    <div id="chat-log"></div>
+    <div class="chat-foot">
+      <textarea id="chat-input" rows="1" placeholder="输入消息…（M3 接入 LLM 后可用）"></textarea>
+      <button id="chat-send" disabled>发送</button>
+    </div>
+  </aside>
+</main>
+
+<script>
+(function () {
+  var ws = null;
+  var procs = {};
+
+  var el = function (id) { return document.getElementById(id); };
+
+  function addEvent(text, kind) {
+    var e = document.createElement('div');
+    e.className = 'evt' + (kind ? ' ' + kind : '');
+    e.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '  ' + text;
+    var log = el('event-log');
+    log.prepend(e);
+    while (log.children.length > 100) log.removeChild(log.lastChild);
+  }
+
+  function addChat(text, kind) {
+    var e = document.createElement('div');
+    e.className = 'msg ' + kind;
+    e.textContent = text;
+    var log = el('chat-log');
+    log.appendChild(e);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function renderProcs() {
+    var names = Object.keys(procs).sort();
+    var up = names.filter(function (n) { return procs[n]; });
+    el('proc-count').textContent = up.length;
+    var list = el('proc-list');
+    list.innerHTML = '';
+    if (!names.length) { list.innerHTML = '<span class="muted">无</span>'; return; }
+    names.forEach(function (n) {
+      var chip = document.createElement('span');
+      chip.className = 'chip ' + (procs[n] ? 'up' : 'down');
+      chip.textContent = n + (procs[n] ? '' : ' ⬇');
+      list.appendChild(chip);
+    });
+  }
+
+  function setProc(name, alive) { procs[name] = !!alive; renderProcs(); }
+
+  function setHeater(on) {
+    el('heater-badge').textContent = on ? '开' : '关';
+    el('heater-badge').className = 'v';
+    el('heater-switch').checked = !!on;
+  }
+
+  function setAlarm(on, text) {
+    if (on) {
+      el('alarm-badge').textContent = '告警';
+      el('alarm-banner').style.display = 'flex';
+      el('alarm-banner-text').textContent = text || '告警中';
+    } else {
+      el('alarm-badge').textContent = '正常';
+      el('alarm-banner').style.display = 'none';
+    }
+  }
+
+  function setTemp(v, state) {
+    el('temp-value').textContent = (typeof v === 'number' && isFinite(v)) ? v.toFixed(1) : '--';
+    var label = state === 'low' ? '低温' : state === 'high' ? '高温' : '正常';
+    var alarm = state === 'low' || state === 'high';
+    var b = el('temp-state');
+    b.textContent = label;
+    b.className = 'badge ' + (alarm ? 'alarm' : 'ok');
+  }
+
+  function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+
+  function handleControlResult(m) {
+    if (!m.ok) {
+      addEvent('操作失败: ' + (m.error || m.cmd), 'alarm');
+      if (m.cmd === 'heater.on') setHeater(false);
+      if (m.cmd === 'heater.off') setHeater(true);
+      return;
+    }
+    if (m.cmd === 'heater.on') setHeater(true);
+    else if (m.cmd === 'heater.off') setHeater(false);
+    else if (m.cmd === 'temperature.read') addEvent('当前温度 ' + (m.result.value || 0).toFixed(1) + ' ℃（' + (m.result.heater_on ? '加热中' : '未加热') + '）');
+    else if (m.cmd === 'ambient.set') addEvent('环境温度固定为 ' + (m.result.ambient || 0).toFixed(1) + ' ℃', 'ok');
+    else if (m.cmd === 'ambient.resume') addEvent('环境温度恢复正弦摆动', 'ok');
+  }
+
+  function connect() {
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+    ws.onopen = function () {
+      el('conn-badge').textContent = '已连接';
+      el('conn-badge').className = 'badge ok';
+      el('chat-send').disabled = false;
+    };
+    ws.onclose = function () {
+      el('conn-badge').textContent = '重连中…';
+      el('conn-badge').className = 'badge alarm';
+      el('chat-send').disabled = true;
+      setTimeout(connect, 1000);
+    };
+    ws.onerror = function () { ws.close(); };
+    ws.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      switch (m.type) {
+        case 'temperature':
+          setTemp(m.value, m.state || 'normal');
+          setHeater(m.heater_on);
+          break;
+        case 'alarm':
+          setAlarm(true, m.text);
+          addChat(m.text || ('⚠️ 告警 ' + m.level), 'alarm');
+          addEvent(m.text || ('告警 ' + m.level), 'alarm');
+          break;
+        case 'alarm_cleared':
+          setAlarm(false);
+          addChat(m.text || '✅ 告警解除', 'system');
+          addEvent(m.text || '告警解除', 'ok');
+          break;
+        case 'status':
+          if (m.processes) {
+            procs = {};
+            (m.processes || []).forEach(function (p) { if (p.name) procs[p.name] = true; });
+            renderProcs();
+          }
+          if (m.process !== undefined && m.process !== null) {
+            setProc(String(m.process), !m.down);
+            addEvent('进程 ' + m.process + (m.down ? ' 掉线' : ' 上线'), m.down ? 'alarm' : 'ok');
+          }
+          break;
+        case 'reply':
+          addChat(m.text || '', 'reply');
+          break;
+        case 'control_result':
+          handleControlResult(m);
+          break;
+      }
+    };
+  }
+
+  // 控制树交互
+  el('heater-switch').addEventListener('change', function () {
+    send({ type: 'control', cmd: this.checked ? 'heater.on' : 'heater.off' });
+  });
+  el('ambient-set').addEventListener('click', function () {
+    var v = parseFloat(el('ambient-input').value);
+    if (!isNaN(v)) send({ type: 'control', cmd: 'ambient.set', value: v });
+  });
+  el('ambient-resume').addEventListener('click', function () {
+    send({ type: 'control', cmd: 'ambient.resume' });
+  });
+  el('read-temp').addEventListener('click', function () {
+    send({ type: 'control', cmd: 'temperature.read' });
+  });
+
+  // 树节点展开/折叠
+  document.querySelectorAll('.thead[data-toggle]').forEach(function (h) {
+    h.addEventListener('click', function () {
+      var node = h.parentElement;
+      node.classList.toggle('open');
+      var a = h.querySelector('.arrow');
+      if (a) a.textContent = node.classList.contains('open') ? '▾' : '▸';
+    });
+  });
+
+  // 对话框
+  function doSend() {
+    var text = el('chat-input').value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    send({ type: 'chat', text: text });
+    addChat(text, 'user');
+    el('chat-input').value = '';
+  }
+  el('chat-send').addEventListener('click', doSend);
+  el('chat-input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>
