@@ -1,0 +1,67 @@
+# M4 部署编排：在 Armbian(R76S) 上 `docker compose up -d` 启动全部进程。
+# 设备无外网：镜像须先在 Mac 上构建并 docker save | scp | docker load（见 scripts/build.sh）。
+# 注意：wasm 容器（runtime / task-thermostat）绝不能用 docker stop/restart/compose restart
+#   （shim 停止路径缺陷会挂死 docker.service），安全换版见项目 CLAUDE.md「wasm 容器硬规则」。
+services:
+  bus:
+    image: event-agent/native:latest
+    command: ["bus", "--listen", "127.0.0.1:7700", "--db", "/data/env.db"]
+    network_mode: host
+    volumes:
+      - ./config:/config:ro
+      - ./data:/data
+    restart: unless-stopped
+
+  hw-temp:
+    image: event-agent/native:latest
+    command: ["hw-temp", "--bus", "127.0.0.1:7700"]
+    network_mode: host
+    volumes:
+      - ./config:/config:ro
+    depends_on: [bus]
+    restart: unless-stopped
+
+  web:
+    image: event-agent/native:latest
+    command: ["web", "--bus", "127.0.0.1:7700", "--listen", "0.0.0.0:8090"]
+    network_mode: host
+    volumes:
+      - ./config:/config:ro
+    depends_on: [bus]
+    restart: unless-stopped
+
+  heartbeat:
+    image: event-agent/native:latest
+    command: ["heartbeat", "--bus", "127.0.0.1:7700"]
+    network_mode: host
+    volumes:
+      - ./config:/config:ro
+    depends_on: [bus]
+    restart: unless-stopped
+
+  llm-gw:
+    image: event-agent/native:latest
+    command: ["llm-gw", "--bus", "127.0.0.1:7700", "--config", "/config/config.json"]
+    network_mode: host
+    volumes:
+      - ./config:/config:ro
+    depends_on: [bus]
+    restart: unless-stopped
+
+  runtime:
+    image: event-agent/runtime:latest
+    platform: wasip1/wasm
+    runtime: io.containerd.wasmedge.v1
+    command: ["--bus", "127.0.0.1:7700", "--rules", "/rules.json"]
+    network_mode: host
+    depends_on: [bus, llm-gw]
+    # wasm 容器不设 restart（shim 停止路径缺陷），崩溃后按 CLAUDE.md 安全流程重启
+
+  task-thermostat:
+    image: event-agent/task-thermostat:latest
+    platform: wasip1/wasm
+    runtime: io.containerd.wasmedge.v1
+    command: ["--bus", "127.0.0.1:7700"]
+    network_mode: host
+    depends_on: [bus]
+    # wasm 容器不设 restart（shim 停止路径缺陷），崩溃后按 CLAUDE.md 安全流程重启

@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1
+# WasmEdge 来宾镜像：FROM scratch + 单个 .wasm 模块。
+# 设备上由 runwasi 的 containerd-shim-wasmedge-v1 运行（platform 必须是 wasip1/wasm）。
+# 用法: docker buildx build --platform wasip1/wasm --build-arg MODULE=<path.wasm> ...
+FROM scratch
+ARG MODULE
+COPY ${MODULE} /app.wasm
+# rules.json 一并打入镜像（runtime 用 --rules /rules.json 读取；读不到时回退硬编码默认，行为一致）
+COPY config/rules.json /rules.json
+ENTRYPOINT ["/app.wasm"]

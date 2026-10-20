@@ -3,4 +3,5 @@ crates/*/target/
 **/*.rs.bk
 config/config.json
 data/
+dist/
 .DS_Store

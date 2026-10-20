@@ -1,0 +1,27 @@
+{
+  "ignore": [
+    "event.temperature.updated",
+    "event.heartbeat.tick",
+    "event.env.changed"
+  ],
+  "rules": [
+    {
+      "id": "low-temp-heat",
+      "when": { "method": "event.temperature.alarm", "data.level": "low" },
+      "then": [{ "method": "action.heater.start" }],
+      "explain": true
+    },
+    {
+      "id": "high-temp-cool",
+      "when": { "method": "event.temperature.alarm", "data.level": "high" },
+      "then": [{ "method": "action.heater.stop" }],
+      "explain": true
+    },
+    {
+      "id": "cleared",
+      "when": { "method": "event.temperature.alarm_cleared" },
+      "then": [],
+      "explain": true
+    }
+  ]
+}

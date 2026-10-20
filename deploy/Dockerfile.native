@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# 原生进程镜像：在 rust 容器内构建全部宿主二进制（linux/arm64），拷入精简运行时。
+# 设备无外网，镜像在 Mac 上 buildx 构建后 docker save → scp → docker load（见 scripts/build.sh）。
+FROM rust:1.90-bookworm AS builder
+WORKDIR /workspace
+
+# 先拷贝清单与源码（显式逐项拷贝，避免把根 target/ 与 git 拉进上下文）
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ea-proto crates/ea-proto
+COPY crates/ea-sysapi crates/ea-sysapi
+COPY crates/bus crates/bus
+COPY crates/hw-temp crates/hw-temp
+COPY crates/web crates/web
+COPY crates/heartbeat crates/heartbeat
+COPY crates/llm-gw crates/llm-gw
+
+# 宿主工作区只含原生成员；一次构建全部 5 个二进制。
+# rusqlite 用 bundled 特性（自带 sqlite3），reqwest 用 rustls，无需系统库。
+RUN cargo build --release -p bus -p hw-temp -p web -p heartbeat -p llm-gw
+
+FROM debian:bookworm-slim
+# llm-gw 经 reqwest/rustls 访问云端 LLM，装 CA 根证书
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder \
+    /workspace/target/release/bus \
+    /workspace/target/release/hw-temp \
+    /workspace/target/release/web \
+    /workspace/target/release/heartbeat \
+    /workspace/target/release/llm-gw \
+    /usr/local/bin/
+
+# 由 compose 的 command: 选择启动哪个二进制
+CMD ["bus", "--listen", "127.0.0.1:7700", "--db", "/data/env.db"]
