@@ -27,6 +27,18 @@
 #
 # 首次接硬件：先探测，不使能伺服
 #   ./deploy/run-motor.sh --probe --ifname end1
+#
+# 再用 --sdo 看对象字典（PRE_OP，不使能）：
+#   ./deploy/run-motor.sh --sdo --ifname end1
+#   → 打印 0x6081/83/84（轮廓速度/加减速）、0x603F（故障码）、
+#     0x1C12/0x1C13 + 0x1600/0x1A00 的 PDO 映射明细
+#
+# 轮廓速度：接线后可用 --speed <counts/s> 指定默认值（20000 = 1 圈/s），
+# 但**只在驱动器里 0x6081 为 0 时才写入**；运行期改速度用
+#   action.motor.set_velocity {axis, velocity}（经 SDO 写 0x6081）
+#
+# 停止：一律 pkill -TERM（SIGTERM 会优雅停机、从站回 INIT）。
+# 用 pkill -9 的话驱动器会锁存 0x7500 通讯故障并闪红灯。
 set -euo pipefail
 
 BIN="${EA_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/motor-ecat}"

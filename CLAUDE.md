@@ -37,7 +37,16 @@
 - **`motor-ecat` 的 RT/RPC 线程分离**：RT 线程 4 ms PDO 循环只碰 IOmap（不分配/不加锁/不写日志/不做总线 I/O）；RPC 线程跑 tokio，收 `action.motor.*` 后经**无锁 SPSC 环**投递即返回，10 Hz 读快照发 `event.motor.status`。RT 线程永不等待 RPC。
 - **`event.motor.status` / `event.motor.reached` 必须进 `ignore`**：10 Hz 事件若走 LLM 推理会打爆上游；只有 `event.motor.alarm` 进决策。`rules.json` 与 `runtime` 的 `DEFAULT_IGNORE` 都要列。
 - **`client.connect` 的路由登记是第 4 个参数 `provide`（不是 `actions`）**：`actions` 只是 `sys.registry.actions` 的元数据；漏传 `provide` 时请求报 `-32601 no provider`。
-- **M5 双后端**：`MockBackend`（全平台，默认，m5.rs 用它）与 `SoemBackend`（仅 Linux，`--ifname` 启用）。SOEM 2.0.0 已 vendor 进 `crates/motor-ecat/vendor/soem/`，由 `build.rs` + `cc`（build-dependency）编译，非运行时依赖；⚠️ SOEM 是 GPLv3/商业双许可，按 GPLv3 用。SOEM 后端**只做过编译验证，未上真实驱动器**——接硬件先跑 `--probe --ifname end1`（只读探测，不使能伺服）。
+- **M5 双后端**：`MockBackend`（全平台，默认，m5.rs 用它）与 `SoemBackend`（仅 Linux，`--ifname` 启用）。SOEM 2.0.0 已 vendor 进 `crates/motor-ecat/vendor/soem/`，由 `build.rs` + `cc`（build-dependency）编译，非运行时依赖；⚠️ SOEM 是 GPLv3/商业双许可，按 GPLv3 用。接硬件先跑 `--probe --ifname end1`（只读探测，不使能伺服）。
+- **M5 真机实测的三个坑（2026-10-22，R76S end1 + 1 台 MOONS）**：
+  - **wkc ≠ 从站数+1**：1 从站实测 `wkc=3`。改为 RT 首个健康周期**自标定** `expect_wkc`，未标定前只把 `wkc==0` 当异常。
+  - **`CONFIG_RT_GROUP_SCHED=y` 时 root 也拿不到 SCHED_FIFO**：systemd 给 `user.slice` 的 `cpu.rt_runtime_us` 是 0，`chrt -f 80 true` 都失败。RT 线程先把 PID 写 `/sys/fs/cgroup/cgroup.procs` 迁到根 cgroup 再 `sched_setscheduler`。
+  - **CiA402 使能必须 `0x06→0x07→0x0F` 逐档推进**（每档 40 ms）；直接发 `0x07` 无效，轴卡在 `0x0250`。主站被 `kill -9` 后 MOONS 锁存 `0x7500` 通讯故障，`motor.enable` 检测到 error≠0 时先发 `0x0080` 复位 32 ms。
+  - **轴数运行时由从站数决定**（`MAX_AXES` 只是数组上界）：1 台驱动器按 2 轴算期望 wkc 会每秒刷假 alarm（进 LLM 决策）。
+  - 开环步进无编码器：`position` 涨**不代表**轴真的转了，需目视/听声确认。
+- **「电机没转」先怀疑速度而不是参数（2026-10-22 第二轮实测）**：驱动器出厂 `0x6081 = 200000 counts/s`（10 圈/s），1000 µstep 只要 20 ms——遥测看是「pos 瞬间跳到目标、vel 恒 0」，肉眼看是「没动」或「动了一下」。用 `--sdo --ifname end1`（PRE_OP，不使能）打印对象字典即可一次看清：`0x6081/83/84` 的实际值、`0x1C12/0x1C13` + `0x1600/0x1A00` 的映射明细（实测与文档逐项吻合：Rx 104 bit / Tx 280 bit）、`0x603F` 锁了什么故障。
+- **速度必须真下发（SDO）**：MOONS 默认 RxPDO 没有 0x6081/0x60FF，PP 轮廓速度只能走 CoE。启动时在 **PRE_OP** 读 0x6081/83/84 并**只补零值**；运行期 `action.motor.set_velocity` 由 `Backend::service()` 在命令到达那一拍发一次 SDO（1–10 ms，会让该周期超时一次，可接受）。不写这一步的话，`task-motor` 的 `speed` 参数就是摆设。
+- **必须优雅停机**：`SIGINT`/`SIGTERM` → `shared.shutdown` → `join` RT 线程 → `SoemBackend::drop` → `ea_ecat_shutdown()` 把从站切回 INIT。**直接 `kill -9` 会让驱动器锁存 `0x7500` 并闪红灯**（只能断电或下次 enable 时发 `0x0080` 复位）。实测 SIGTERM 后 `0x603F=0`、`0x6041=0x0650`。
 - **演示任务用 `action.task.motor_demo`（不是 `task.start`）**：总线前缀路由**单属主**（同前缀第二次注册被拒），`action.task.start` 已归 `task-thermostat`。`task-motor` 是 Wasm 访客，只经 RPC 调 `action.motor.*` 编排「顺 n 圈 → 逆 m 圈 → 停机」，先应答 `{"started":true}`、完成发 `event.task.stopped`，等待期间照常应答 `sys.ping`（否则心跳判软挂），任何分支都以 `motor.stop` 收尾。
 - **交叉编译必须隔离 `CARGO_TARGET_DIR`**：`r2s-build` 容器与 Mac 共用 `./target` 会把 Mac 的二进制覆盖成 aarch64 ELF，之后本机 `cargo test` 全部错乱（曾踩）。用 `-e CARGO_TARGET_DIR=/tmp/arm-target`。
 

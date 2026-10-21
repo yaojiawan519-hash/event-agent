@@ -476,9 +476,31 @@ bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 - `csrc/ea_ecat.c` 只做「init → config_init → config_map_group → SAFE_OP → OP」+ 一次 PDO 收发 + 暴露从站 PDO 指针，**不含 PDO pump 线程**——周期由 Rust 的 RT 线程驱动，保证与总线 I/O 彻底分离。
 - PDO 字节打包/解包留在 Rust（布局按 CLAUDE.md 的 MOONS 记录：RxPDO 13 B / TxPDO 35 B）。
 - **`--probe --ifname <dev>`** 是接硬件的第一站：只读探测从站数量、vendor/product、PDO 尺寸与 AL 状态，**不使能伺服**。先确认布局再上电，避免用错偏移量驱动电机。
+- **`--sdo --ifname <dev>`** 是第二站：在 PRE_OP 下把对象字典打出来（0x603F/6040/6041/6060/6061/6064/607A/6081/6083/6084 + 0x1C12/0x1C13 的 PDO 分配与 0x1600/0x1A00 映射明细），同样**不进 OP、不使能**。用来回答「映射对不对」「速度参数是不是 0」「驱动器锁了什么故障」。
+- **轮廓参数走 SDO，不走 PDO**：MOONS 默认 RxPDO 里没有 0x6081，PP 模式的轮廓速度只能靠 CoE 写。约定是：`SoemBackend::new` 在 **PRE_OP**（此时邮箱可用、PDO 尚未生效）读 0x6081/83/84，**只补零值**不覆盖驱动器设定；运行期 `action.motor.set_velocity` 由 `Backend::service()` 钩子在命令到达的那一拍发一次 SDO（1–10 ms，会让该周期超时一次；参数设置极少发生，比每周期轮询代价小）。
+- **优雅停机是硬要求**：`main` 收 SIGINT/SIGTERM 后先置 `shared.shutdown`、`join` RT 线程，让 `SoemBackend::drop` 调 `ea_ecat_shutdown()` 把从站切回 INIT。**直接 `kill -9` 会让驱动器锁存 `0x7500` 通讯故障并闪红灯**（只能断电或在使能时发 `0x0080` 复位）。
 - 交叉编译（Mac → aarch64）：用 `r2s-build` 容器 `cargo build -p motor-ecat`。⚠️ **务必设 `CARGO_TARGET_DIR`** 指向容器内路径，否则会覆盖 Mac 的 `target/`（本机二进制变成 Linux ELF，后续本机测试全乱）。
 
-**未验证项（诚实标注）**：`SoemBackend` 的 PDO 偏移与 CiA402 FSM 只做过**编译验证**（linux/aarch64），尚未在真实 MOONS 驱动器上跑过——接入硬件时必须先 `--probe` 核对，再逐轴使能。
+**真机实测（2026-10-22，R76S end1 + 1 台 MOONS STF06-ECX-mini）**：
+
+- `--probe` 发现 1 从站，vendor=0x168 / product=0x16 / **RxPDO 13 B、TxPDO 35 B**——与记录布局一致，偏移无需调整。
+- 下面三个坑只有在真机上才暴露，均已修掉并把原因写进代码注释：
+  1. **wkc 不是「从站数+1」**：1 个从站实测 `wkc=3`（SOEM 的 LRW 计数是 `2*OutputsWKC + InputsWKC`）。故不写死公式，改为 **RT 首个健康周期自标定** `expect_wkc`；未标定前只把 `wkc==0` 当异常，避免启动瞬间误报。
+  2. **`CONFIG_RT_GROUP_SCHED=y` 下 root 也拿不到 SCHED_FIFO**：systemd 给 `user.slice` 的 `cpu.rt_runtime_us` 默认 0（`chrt -f 80 true` 都失败）。RT 线程初始化时先把进程 PID 写入 `/sys/fs/cgroup/cgroup.procs` 迁到根 cgroup，再 `sched_setscheduler`。
+  3. **CiA402 使能必须逐级推进**：`0x06 → 0x07 → 0x0F`，每档保持 40 ms（`ENABLE_DWELL=10` 周期）；直接从 Switch on disabled 发 `0x07` 会被忽略，轴永远停在 `0x0250`。另外主站被 `kill -9` 后 MOONS 会锁存 **`0x7500` 通讯故障**，`motor.enable` 检测到错误码非零时先发 `0x0080`（bit7 上升沿）复位 32 ms，否则使能序列全被忽略。
+- 轴数改为**运行时由从站数决定**（`MAX_AXES` 只是数组上界）：只有 1 台驱动器时按 2 轴算期望 wkc 会每秒刷假 alarm（而 alarm 进 LLM 决策）。
+- 演示任务端到端实测：`action.task.motor_demo {turns_cw:0.05, turns_ccw:0.05, speed:20000}` → ACK → `event.task.started` → `move_abs 0→1000→0` → `event.task.stopped{reason:"done"}` → 断使能，`statusword` 0x0637 → 0x0650。
+
+**第二轮实测（同日，`--sdo` 追查「电机不转」后）**：
+
+- 现场症状是「驱动器闪红灯、电机没转」，但遥测显示 `pos` 150 ms 内直接跳到目标、`vel` 恒为 0——一度怀疑轮廓速度为 0。`--sdo` 一次否掉了三个猜测：
+  - **`0x6081 = 200000 counts/s`（10 圈/s）**，0x6083 = 2000000、0x6084 = 500000：轮廓参数齐全，只是**太快**——1000 µstep（18°）20 ms 就走完，肉眼看就是「没动/动了一下」。把速度降到 5000（0.25 圈/s）后位置平滑爬升、`vel` 遥测 ±5000，1 圈约 3.3 s，肉眼清楚可见。
+  - **PDO 映射与文档逐项吻合**：Rx `0x1600` = 0x6040/0x6060/0x607A/0x60B8/0x60FE:1（104 bit = 13 B），Tx `0x1A00` = 0x603F/0x6041/0x6061/0x6064/0x606C/0x60B9/0x60BA/0x60BB/0x60BC/0x60BD/0x60FD（280 bit = 35 B）。偏移量可按文档硬编码。
+  - **红灯 = `0x603F = 0x7500` 通讯故障锁存**，来源是上一轮 `pkill -9` 把主站从 OP 里拽走。新二进制 `enable` 时自动发 `0x0080` 复位，日志可见 `轴有锁存故障 0x7500，先发故障复位`。
+- 由此定下两条产品行为：**设置速度必须真的下发**（`set_velocity` → SDO 写 0x6081，否则驱动任务里的 `speed` 参数是摆设）；**退出必须走优雅停机**（SIGTERM → RT 线程 join → 从站回 INIT），实测停机后 `0x603F = 0`、`0x6041 = 0x0650`，驱动器不再闪红灯。
+- 低速运动实测曲线（5000 counts/s，1 圈）：`sw 0x0637 → 0x0237(运动中) → 0x0637(到位)`，`vel` 5000 → 0，`pos` 0→20000→0 全程单调无跳变。
+
+**仍未验证**：2 从站拓扑（第二台驱动器未接）、**电机轴是否真的转动**（开环步进无编码器，`0x6064` 只是驱动器自生成的指令计数，不动也照样涨——需目视/听声确认）、PID 位置环。
 
 **演示任务 `task-motor`（Wasm 访客）**：把「顺 n 圈 → 逆 m 圈 → 停机」编排成一个可由 Agent 触发的动作 `action.task.motor_demo`。
 
@@ -488,7 +510,7 @@ bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 - **到位判定**：`statusword` bit10（Target reached）+ 位置容差 200 µsteps；驱动器没给 bit10 时，连续 3 个节拍稳定在容差内也算到位（避免卡死）。
 - **收尾必停机**：任何分支（含出错）都以 `action.motor.stop` 结束——急停走 motor-ecat 的独立路径，不排队。
 
-**安全**：进程被 kill 时 MOONS 靠 EtherCAT 看门狗自停；`action.motor.stop` 是软件急停；RT 线程检测 wkc 连续异常应主动断使能（SOEM 后端接入时实现）。
+**安全**：进程被 kill 时 MOONS 靠 EtherCAT 看门狗自停；`action.motor.stop` 是软件急停；`SIGTERM`/`SIGINT` 走优雅停机（见 §8.8）。RT 线程检测 wkc 连续异常应主动断使能（SOEM 后端接入时实现）。
 
 ## 9. 配置
 

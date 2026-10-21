@@ -43,4 +43,11 @@ int ea_ecat_slave(int idx, ea_ecat_slave_t *out);
 /* 一次 PDO 收发：send + receive。返回工作计数 wkc，负值为错误码。 */
 int ea_ecat_pdo_cycle(void);
 
+/* CoE SDO 读（须在 PRE_OP；*size 传入缓冲区大小、传出实际长度）。
+ * 返回 0 成功，负值为错误码。 */
+int ea_ecat_sdo_read(int slave, uint16_t index, uint8_t sub, void *buf, int *size);
+
+/* CoE SDO 写。返回 0 成功，负值为错误码。 */
+int ea_ecat_sdo_write(int slave, uint16_t index, uint8_t sub, const void *buf, int size);
+
 #endif /* EA_ECAT_H */

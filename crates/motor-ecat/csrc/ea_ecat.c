@@ -141,6 +141,27 @@ int ea_ecat_slave(int idx, ea_ecat_slave_t *out)
     return 0;
 }
 
+int ea_ecat_sdo_read(int slave, uint16_t index, uint8_t sub, void *buf, int *size)
+{
+    if (!g_ctx || !buf || !size) return EA_ECAT_ERR_ARG;
+    if (slave < 1 || slave > g_slave_count) return EA_ECAT_ERR_ARG;
+    int sz = *size;
+    int wkc = ecx_SDOread(g_ctx, (uint16)slave, (uint16)index, (uint8)sub, FALSE,
+                          &sz, buf, EC_TIMEOUTRXM);
+    if (wkc <= 0) return EA_ECAT_ERR_STATE;
+    *size = sz;
+    return 0;
+}
+
+int ea_ecat_sdo_write(int slave, uint16_t index, uint8_t sub, const void *buf, int size)
+{
+    if (!g_ctx || !buf) return EA_ECAT_ERR_ARG;
+    if (slave < 1 || slave > g_slave_count) return EA_ECAT_ERR_ARG;
+    int wkc = ecx_SDOwrite(g_ctx, (uint16)slave, (uint16)index, (uint8)sub, FALSE,
+                           size, (void *)buf, EC_TIMEOUTRXM);
+    return wkc > 0 ? 0 : EA_ECAT_ERR_STATE;
+}
+
 int ea_ecat_pdo_cycle(void)
 {
     if (!g_ctx) return EA_ECAT_ERR_STATE;
