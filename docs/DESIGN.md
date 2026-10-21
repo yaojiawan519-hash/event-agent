@@ -112,6 +112,7 @@ flowchart TB
 | `runtime` | AI 代理层 | Wasm（WasmEdge） | `event.*` | `action.runtime.*`（预留） |
 | `task-thermostat` | AI 代理层（任务进程） | Wasm（WasmEdge） | `event.task.stop` | `action.task.start`、`action.task.stop` |
 | `motor-ecat` | 系统进程（**实时**硬件进程） | **原生进程**（非容器，见 §8.8） | — | `action.motor.*` |
+| `task-motor` | AI 代理层（任务进程） | Wasm（WasmEdge） | — | `action.task.motor_demo` |
 
 所有进程都必须响应 `sys.ping` 请求。
 
@@ -462,7 +463,30 @@ bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 
 **运行形态**：**原生进程**（非 Docker 容器）——硬实时需要 `SCHED_FIFO`、绑核、raw socket 与定向 `mlock`，容器化会引入 cgroup 调度配额与 `RT_GROUP_SCHED` EPERM 等额外变量。这偏离 §4.3「所有进程容器化」的一般约定，属本节的显式例外。
 
-**后端**：当前为 `MockBackend`（软件仿真，不驱动真实硬件），用于验证线程模型与协议契约；SOEM/EtherCAT 后端接入点是 `Backend` trait。接真实硬件时，复用 LinuxWasm 项目已验证的 `hal_ecat.c`（SOEM 封装 + RT pump）。
+**后端**（`Backend` trait，运行时用 `--mock` / `--ifname` 选择）：
+
+| 后端 | 平台 | 用途 |
+| --- | --- | --- |
+| `MockBackend` | 全平台 | 软件仿真，验证线程模型与协议契约（`crates/bus/tests/m5.rs` 用它） |
+| `SoemBackend` | **仅 Linux** | 真实 EtherCAT，经 `csrc/ea_ecat.c` 调 SOEM |
+
+`SoemBackend` 的结构：
+
+- **SOEM 2.0.0 已 vendor 进仓**（`crates/motor-ecat/vendor/soem/`，444 KB，只含 `include/` + `src/` + `osal/linux` + `oshw/linux`），由 `build.rs` 用 `cc`（build-dependency）编译；**不是运行时依赖**，macOS 目标上 `build.rs` 直接返回，符号不参与链接。⚠️ SOEM 是 **GPLv3 / 商业双许可**，按 GPLv3 使用（分发本进程即受 GPLv3 约束）。
+- `csrc/ea_ecat.c` 只做「init → config_init → config_map_group → SAFE_OP → OP」+ 一次 PDO 收发 + 暴露从站 PDO 指针，**不含 PDO pump 线程**——周期由 Rust 的 RT 线程驱动，保证与总线 I/O 彻底分离。
+- PDO 字节打包/解包留在 Rust（布局按 CLAUDE.md 的 MOONS 记录：RxPDO 13 B / TxPDO 35 B）。
+- **`--probe --ifname <dev>`** 是接硬件的第一站：只读探测从站数量、vendor/product、PDO 尺寸与 AL 状态，**不使能伺服**。先确认布局再上电，避免用错偏移量驱动电机。
+- 交叉编译（Mac → aarch64）：用 `r2s-build` 容器 `cargo build -p motor-ecat`。⚠️ **务必设 `CARGO_TARGET_DIR`** 指向容器内路径，否则会覆盖 Mac 的 `target/`（本机二进制变成 Linux ELF，后续本机测试全乱）。
+
+**未验证项（诚实标注）**：`SoemBackend` 的 PDO 偏移与 CiA402 FSM 只做过**编译验证**（linux/aarch64），尚未在真实 MOONS 驱动器上跑过——接入硬件时必须先 `--probe` 核对，再逐轴使能。
+
+**演示任务 `task-motor`（Wasm 访客）**：把「顺 n 圈 → 逆 m 圈 → 停机」编排成一个可由 Agent 触发的动作 `action.task.motor_demo`。
+
+- **为什么不走 `action.task.start`**：总线的前缀路由是**单属主**的（同名前缀第二次注册会被拒），`action.task.start` 已被 `task-thermostat` 占用。故每个任务进程各占一个具体方法名；参数里的 `task` 字段只是语义标签，不参与路由。若将来任务进程变多，再引入「按任务名路由」的总线能力。
+- **参数**：`{turns_cw, turns_ccw, speed, axis}`，全部可选，缺省 2 圈顺 / 2 圈逆 / 20000 counts/s（1 圈/s）/ 轴 0。非法参数（负圈数、非正速度）在**执行前**返回 `INVALID_PARAMS`。
+- **长任务语义**：秒级动作，先应答 `{"started":true}` 再执行，完成后发 `event.task.stopped {task:"motor_demo", reason:"done"|"error"}`。等待期间用 100 ms 节拍轮询 `action.motor.read` 并**照常应答 `sys.ping`**，否则心跳会把正忙着的进程判成软挂。
+- **到位判定**：`statusword` bit10（Target reached）+ 位置容差 200 µsteps；驱动器没给 bit10 时，连续 3 个节拍稳定在容差内也算到位（避免卡死）。
+- **收尾必停机**：任何分支（含出错）都以 `action.motor.stop` 结束——急停走 motor-ecat 的独立路径，不排队。
 
 **安全**：进程被 kill 时 MOONS 靠 EtherCAT 看门狗自停；`action.motor.stop` 是软件急停；RT 线程检测 wkc 连续异常应主动断使能（SOEM 后端接入时实现）。
 
@@ -504,7 +528,9 @@ event-agent/
 │   ├── heartbeat/
 │   ├── llm-gw/
 │   ├── runtime/              # AI 代理层（wasm32-wasip1）
-│   └── task-thermostat/      # AI 代理层（wasm32-wasip1）
+│   ├── task-thermostat/      # AI 代理层（wasm32-wasip1）
+│   ├── task-motor/           # 电机演示任务（wasm32-wasip1）
+│   └── motor-ecat/           # 实时硬件进程（原生；vendor/soem + csrc/ea_ecat.c）
 ├── config/
 │   ├── config.example.json
 │   └── rules.json
@@ -558,7 +584,7 @@ services:
   llm-gw:    {image: event-agent/llm-gw:latest,    network_mode: host, volumes: ["./config:/config:ro"], depends_on: [bus], restart: unless-stopped}
   runtime:
     image: event-agent/runtime:latest
-    platform: wasi/wasm
+    platform: wasip1/wasm
     runtime: io.containerd.wasmedge.v1
     network_mode: host
     volumes: ["./config:/config:ro"]
@@ -566,7 +592,15 @@ services:
     restart: unless-stopped
   task-thermostat:
     image: event-agent/task-thermostat:latest
-    platform: wasi/wasm
+    platform: wasip1/wasm
+    runtime: io.containerd.wasmedge.v1
+    network_mode: host
+    volumes: ["./config:/config:ro"]
+    depends_on: [bus]
+    restart: unless-stopped
+  task-motor:
+    image: event-agent/task-motor:latest
+    platform: wasip1/wasm
     runtime: io.containerd.wasmedge.v1
     network_mode: host
     volumes: ["./config:/config:ro"]
@@ -622,9 +656,10 @@ sequenceDiagram
 | **M2 运行时（Wasm）+ 规则** | `ea-wasmapi`、`runtime`，以 `wasmedge` 直接运行 | low 告警后 2 s 内 `heater.on` 变为 `true`，high 告警后变为 `false`；`event.runtime.decision` 的 `mode` 为 `rule` |
 | **M3 LLM 推理 + 任务进程** | `llm-gw`、`task-thermostat`，规则 `explain` | 对话框输入“把温度保持在 25 度”，30 s 内收到回复且 `task.hold_temp.enabled=true`，随后温度在 5 分钟内进入 25 ± 2 ℃ 并保持；清空 `rules` 后 low 告警仍能由 LLM 触发 `heater.start` |
 | **M4 Docker + WasmEdge 部署** | 镜像、compose、`host-setup.sh` | 在 Armbian 上 `docker compose up -d` 后，M1–M3 的全部验收项通过；`docker ps` 显示 `runtime` 与 `task-thermostat` 使用 `io.containerd.wasmedge.v1` |
-| **M5 实时运动控制（原生）** | `motor-ecat`（RT/RPC 线程分离 + 无锁命令环 + mock 后端），`ea-proto` 新增 `action.motor.*` / `event.motor.*` | `crates/bus/tests/m5.rs`：进程注册并登记全部 `action.motor.*`；`move_abs` 投递即返回（<500 ms）；`event.motor.reached` 在 5 s 内到达且位置正确；`motor.read` 读回快照；`motor.stop` 后断使能；参数非法返回 `INVALID_PARAMS` |
+| **M5 实时运动控制（原生）** | `motor-ecat`（RT/RPC 线程分离 + 无锁命令环 + mock/SOEM 双后端），`ea-proto` 新增 `action.motor.*` / `event.motor.*` | `crates/bus/tests/m5.rs`：进程注册并登记全部 `action.motor.*`；`move_abs` 投递即返回（<500 ms）；`event.motor.reached` 在 5 s 内到达且位置正确；`motor.read` 读回快照；`motor.stop` 后断使能；参数非法返回 `INVALID_PARAMS` |
+| **M5 电机演示任务（Wasm）** | `task-motor.wasm` + `action.task.motor_demo` | 同一测试文件：`motor_demo` 立即应答；20 s 内收到 `event.task.stopped` 且 `reason=done`；顺 1 圈再逆 1 圈后回到起点位置且断使能；负圈数/非正速度返回 `INVALID_PARAMS`（执行前拒绝） |
 
-后续扩展点（不在本期）：`spawner` 服务按需 `docker run` 任务进程；硬件进程接真实 Modbus / 串口；规则数量大时用 RAG 检索替代 `rules.json` 线性匹配；`motor-ecat` 的 SOEM 后端与 PID 位置环；Zephyr 侧的硬件进程通过串口以同样的 JSON-RPC 帧接入总线。
+后续扩展点（不在本期）：`spawner` 服务按需 `docker run` 任务进程；硬件进程接真实 Modbus / 串口；规则数量大时用 RAG 检索替代 `rules.json` 线性匹配；`motor-ecat` 的 PID 位置环与硬件到位校验；Zephyr 侧的硬件进程通过串口以同样的 JSON-RPC 帧接入总线。
 
 ## 13. 给 Claude Code 的实施约束
 

@@ -14,3 +14,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # 实时调度（SCHED_FIFO / 绑核 / mlock）只在 Linux 目标上可用。
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
+
+[build-dependencies]
+cc = "1.9.0"

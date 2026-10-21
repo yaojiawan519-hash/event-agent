@@ -65,3 +65,14 @@ services:
     network_mode: host
     depends_on: [bus]
     # wasm 容器不设 restart（shim 停止路径缺陷），崩溃后按 CLAUDE.md 安全流程重启
+
+  # 电机演示任务：顺 n 圈 → 逆 m 圈 → 停机。只经统一 RPC 调 action.motor.*，
+  # 真正的实时 PDO 循环在原生进程 motor-ecat 里（不在本 compose 中，见 DESIGN §8.8）。
+  task-motor:
+    image: event-agent/task-motor:latest
+    platform: wasip1/wasm
+    runtime: io.containerd.wasmedge.v1
+    command: ["--bus", "127.0.0.1:7700"]
+    network_mode: host
+    depends_on: [bus]
+    # wasm 容器不设 restart（shim 停止路径缺陷），崩溃后按 CLAUDE.md 安全流程重启

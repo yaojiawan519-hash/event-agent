@@ -112,21 +112,61 @@ where
 }
 
 async fn connect_observer(port: u16) -> Client {
+    connect_sub(port, "m5-observer", &["event.motor.*"]).await
+}
+
+async fn connect_sub(port: u16, name: &str, subscribe: &[&str]) -> Client {
     for _ in 0..100 {
-        match Client::connect(
-            &format!("127.0.0.1:{port}"),
-            "m5-observer",
-            &["event.motor.*"],
-            &[],
-            &[],
-        )
-        .await
-        {
+        match Client::connect(&format!("127.0.0.1:{port}"), name, subscribe, &[], &[]).await {
             Ok(c) => return c,
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
-    panic!("observer could not connect to bus");
+    panic!("{name} could not connect to bus");
+}
+
+fn wasm(name: &str) -> std::path::PathBuf {
+    let p = workspace_root().join(format!(
+        "crates/{name}/target/wasm32-wasip1/release/{name}.wasm"
+    ));
+    assert!(
+        p.exists(),
+        "{name}.wasm not found; run `rustup run beta cargo build --target wasm32-wasip1 --release --manifest-path crates/{name}/Cargo.toml` (see scripts/smoke.sh)"
+    );
+    p
+}
+
+/// 轮询注册表，等某个动作方法出现（进程启动顺序不确定）。
+async fn wait_for_action(client: &Client, wanted: &str, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if let Ok(v) = client.call(method::SYS_REGISTRY_ACTIONS, json!({})).await {
+            let found = v
+                .get("actions")
+                .and_then(|a| a.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|a| a.get("method").and_then(|m| m.as_str()) == Some(wanted))
+                })
+                .unwrap_or(false);
+            if found {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+fn spawn_task_motor(port: u16) -> ChildGuard {
+    let child = Command::new("wasmedge")
+        .arg(wasm("task-motor"))
+        .arg("--bus")
+        .arg(format!("127.0.0.1:{port}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn wasmedge task-motor（PATH 需要 wasmedge，见 scripts/smoke.sh）");
+    ChildGuard(child)
 }
 
 #[tokio::test]
@@ -249,6 +289,113 @@ async fn m5_motor_rpc_contract() {
             ea_proto::error::INVALID_PARAMS,
             "应返回 INVALID_PARAMS"
         ),
+        other => panic!("期望 Rpc 错误，实际 {other:?}"),
+    }
+}
+
+/// M5 演示任务：`task-motor.wasm` 经 `action.task.motor_demo` 驱动电机
+/// 「顺时针 n 圈 → 逆时针 m 圈 → 停机」。
+///
+/// 验证的是 **Agent 可编排**：任务进程只经统一 RPC 调 `action.motor.*`，
+/// 不碰硬件；秒级长任务先应答再执行，完成后发 `event.task.stopped`。
+#[tokio::test]
+async fn m5_motor_demo_task() {
+    let port = free_port();
+    let _bus = spawn_bus(port);
+    let addr = format!("127.0.0.1:{port}");
+    wait_ready(&addr);
+
+    // 事件订阅者先连上，否则会漏掉后面的 task.started / task.stopped。
+    let observer = connect_sub(port, "m5-demo-observer", &["event.task.*"]).await;
+    let caller = connect_sub(port, "m5-demo-caller", &[]).await;
+
+    let _motor = spawn_motor(port);
+    let _task = spawn_task_motor(port);
+
+    // —— 1) 两个进程都就绪（顺序不定：任务可能在 motor-ecat 之前注册完）——
+    for m in [action::MOTOR_READ, action::TASK_MOTOR_DEMO] {
+        assert!(
+            wait_for_action(&caller, m, 200).await,
+            "动作 {m} 未在 10s 内登记（motor-ecat / task-motor 是否已启动？）"
+        );
+    }
+
+    // —— 2) 启动：立即应答，不等运动完成 ——
+    let t0 = std::time::Instant::now();
+    let ack = caller
+        .call(
+            action::TASK_MOTOR_DEMO,
+            json!({"turns_cw": 1.0, "turns_ccw": 1.0, "speed": 20000, "axis": 0}),
+        )
+        .await
+        .expect("motor_demo 应被接受");
+    assert_eq!(ack.get("started").and_then(|v| v.as_bool()), Some(true));
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "motor_demo 必须投递即返回（实际 {:?}）—— 一秒级的演示不能在请求里跑完",
+        t0.elapsed()
+    );
+
+    // —— 3) 完成事件（1 圈顺 + 1 圈逆 ≈ 2 s）——
+    let stopped = wait_for_event(&observer, Duration::from_secs(20), |m, d| {
+        m == event::TASK_STOPPED && d.get("task").and_then(|t| t.as_str()) == Some("motor_demo")
+    })
+    .await
+    .expect("20s 内未收到 event.task.stopped");
+    assert_eq!(
+        stopped.get("reason").and_then(|r| r.as_str()),
+        Some("done"),
+        "演示应正常跑完：{stopped}"
+    );
+
+    // —— 4) 收尾：回到起点并断使能 ——
+    let snap = caller
+        .call(action::MOTOR_READ, json!({}))
+        .await
+        .expect("motor.read 应成功");
+    let axis0 = snap
+        .get("axes")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .expect("应有 axis 0");
+    assert_eq!(
+        axis0.get("position").and_then(|v| v.as_i64()),
+        Some(0),
+        "顺 1 圈再逆 1 圈应回到起点 0"
+    );
+    assert_eq!(
+        axis0.get("enabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "演示结束后必须停机断使能"
+    );
+}
+
+/// 参数非法要在**执行前**被拒绝（不能先转起来再报错）。
+#[tokio::test]
+async fn m5_motor_demo_rejects_bad_params() {
+    let port = free_port();
+    let _bus = spawn_bus(port);
+    wait_ready(&format!("127.0.0.1:{port}"));
+
+    let caller = connect_sub(port, "m5-demo-badparams", &[]).await;
+    let _motor = spawn_motor(port);
+    let _task = spawn_task_motor(port);
+
+    // 先确认已注册——否则 METHOD_NOT_FOUND 会被误当成「参数被拒」。
+    assert!(
+        wait_for_action(&caller, action::TASK_MOTOR_DEMO, 200).await,
+        "task-motor 未登记 {}",
+        action::TASK_MOTOR_DEMO
+    );
+
+    let err = caller
+        .call(action::TASK_MOTOR_DEMO, json!({"turns_cw": -3}))
+        .await
+        .expect_err("负圈数应报参数错误");
+    match err {
+        ea_sysapi::Error::Rpc { code, .. } => {
+            assert_eq!(code, ea_proto::error::INVALID_PARAMS, "应返回 INVALID_PARAMS")
+        }
         other => panic!("期望 Rpc 错误，实际 {other:?}"),
     }
 }

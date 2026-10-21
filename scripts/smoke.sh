@@ -15,6 +15,8 @@ rustup run beta cargo build --target wasm32-wasip1 --release \
   --manifest-path crates/runtime/Cargo.toml
 rustup run beta cargo build --target wasm32-wasip1 --release \
   --manifest-path crates/task-thermostat/Cargo.toml
+rustup run beta cargo build --target wasm32-wasip1 --release \
+  --manifest-path crates/task-motor/Cargo.toml
 
 echo "== 运行全部集成测试 =="
 cargo test --workspace -- --nocapture

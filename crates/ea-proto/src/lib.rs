@@ -66,6 +66,11 @@ pub mod action {
     pub const MOTOR_HOME: &str = "action.motor.home";
     pub const MOTOR_SET_VELOCITY: &str = "action.motor.set_velocity";
     pub const MOTOR_READ: &str = "action.motor.read";
+    /// 电机演示任务（`task-motor` Wasm 访客提供）：顺时针 n 圈 → 逆时针 m 圈 → 停机。
+    /// 秒级长任务：立即应答 `{"started":true}`，完成后发 `event.task.stopped`。
+    /// 注：不走 `action.task.start`——总线的前缀路由是**单属主**的，同名前缀会被
+    /// 拒绝（`task-thermostat` 已占用 `action.task.start`），故任务进程各占一个方法名。
+    pub const TASK_MOTOR_DEMO: &str = "action.task.motor_demo";
 }
 
 /// JSON-RPC 2.0 错误码。

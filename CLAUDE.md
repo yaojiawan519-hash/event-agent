@@ -37,7 +37,9 @@
 - **`motor-ecat` 的 RT/RPC 线程分离**：RT 线程 4 ms PDO 循环只碰 IOmap（不分配/不加锁/不写日志/不做总线 I/O）；RPC 线程跑 tokio，收 `action.motor.*` 后经**无锁 SPSC 环**投递即返回，10 Hz 读快照发 `event.motor.status`。RT 线程永不等待 RPC。
 - **`event.motor.status` / `event.motor.reached` 必须进 `ignore`**：10 Hz 事件若走 LLM 推理会打爆上游；只有 `event.motor.alarm` 进决策。`rules.json` 与 `runtime` 的 `DEFAULT_IGNORE` 都要列。
 - **`client.connect` 的路由登记是第 4 个参数 `provide`（不是 `actions`）**：`actions` 只是 `sys.registry.actions` 的元数据；漏传 `provide` 时请求报 `-32601 no provider`。
-- **M5 后端当前是 mock**：`motor-ecat` 用 `MockBackend` 软件仿真（不驱动真实硬件），SOEM 后端接入点是 `Backend` trait；接真实 EtherCAT 时复用 LinuxWasm 已验证的 `hal_ecat.c`。
+- **M5 双后端**：`MockBackend`（全平台，默认，m5.rs 用它）与 `SoemBackend`（仅 Linux，`--ifname` 启用）。SOEM 2.0.0 已 vendor 进 `crates/motor-ecat/vendor/soem/`，由 `build.rs` + `cc`（build-dependency）编译，非运行时依赖；⚠️ SOEM 是 GPLv3/商业双许可，按 GPLv3 用。SOEM 后端**只做过编译验证，未上真实驱动器**——接硬件先跑 `--probe --ifname end1`（只读探测，不使能伺服）。
+- **演示任务用 `action.task.motor_demo`（不是 `task.start`）**：总线前缀路由**单属主**（同前缀第二次注册被拒），`action.task.start` 已归 `task-thermostat`。`task-motor` 是 Wasm 访客，只经 RPC 调 `action.motor.*` 编排「顺 n 圈 → 逆 m 圈 → 停机」，先应答 `{"started":true}`、完成发 `event.task.stopped`，等待期间照常应答 `sys.ping`（否则心跳判软挂），任何分支都以 `motor.stop` 收尾。
+- **交叉编译必须隔离 `CARGO_TARGET_DIR`**：`r2s-build` 容器与 Mac 共用 `./target` 会把 Mac 的二进制覆盖成 aarch64 ELF，之后本机 `cargo test` 全部错乱（曾踩）。用 `-e CARGO_TARGET_DIR=/tmp/arm-target`。
 
 ## 设备事实（2026-10-20 实测）
 
@@ -54,4 +56,4 @@
 - [x] M2 运行时 + 规则（ea-wasmapi / runtime）
 - [x] M3 LLM + 任务进程（llm-gw / task-thermostat）
 - [x] M4 Docker + WasmEdge 部署
-- [x] M5 实时运动控制（motor-ecat，RT/RPC 分离 + mock 后端）
+- [x] M5 实时运动控制（motor-ecat，RT/RPC 分离 + mock/SOEM 双后端）
