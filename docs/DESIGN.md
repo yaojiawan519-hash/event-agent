@@ -111,6 +111,7 @@ flowchart TB
 | `llm-gw` | 系统进程 | 原生容器 | — | `sys.llm.chat` |
 | `runtime` | AI 代理层 | Wasm（WasmEdge） | `event.*` | `action.runtime.*`（预留） |
 | `task-thermostat` | AI 代理层（任务进程） | Wasm（WasmEdge） | `event.task.stop` | `action.task.start`、`action.task.stop` |
+| `motor-ecat` | 系统进程（**实时**硬件进程） | **原生进程**（非容器，见 §8.8） | — | `action.motor.*` |
 
 所有进程都必须响应 `sys.ping` 请求。
 
@@ -413,6 +414,58 @@ LLM 推理回合：
 
 - 这是原文“循环读取总线数据、按算法控制温度”的最小版本；把 bang-bang 换成 PID 只改一个函数。
 
+### 8.8 `motor-ecat`：实时运动控制进程（M5） **【提案】**
+
+把 EtherCAT 步进电机（2 × MOONS STF06-ECX-mini，PP 模式）作为**实时硬件进程**接入统一 RPC 总线。
+
+**线程模型（本进程的核心约束）**：
+
+```text
+bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
+                       · 收 action.motor.*，投递命令后立即应答
+                       · 按 10 Hz 读快照发 event.motor.status / reached / alarm
+                             │  命令环（无锁 SPSC，AtomicU64 槽，定长）
+                             │  状态快照（原子字段，无锁）
+                       RT 线程（SCHED_FIFO 80 + 绑 CPU + 定向 mlock）
+                       · 4 ms 周期 PDO 循环，只碰 IOmap
+                       · 不做分配 / 加锁 / 日志 / 总线 I/O
+```
+
+- **RT 线程绝不等待 RPC**。命令是投递式的：`action.motor.move_abs` 立即返回 `{"accepted":true}`，运动完成由 `event.motor.reached` 通知。
+- RT 线程每个周期最多排空 16 条命令，防止命令洪泛饿死 PDO 循环；环满时 RPC 返回 `INTERNAL_ERROR`。
+- 周期调度用 `CLOCK_MONOTONIC` + `clock_nanosleep(TIMER_ABSTIME)`，不累积漂移。
+- **定向 `mlock`（IOmap + 共享状态），严禁 `mlockall`**——锁住整个进程会破坏 AF_PACKET raw socket（周期 wkc 塌到 1、TxPDO 全零、伺服 Err 80）。
+- `action.motor.stop` 走**急停独立路径**：直接置位 `estop`，RT 在下一个周期最优先处理，不排队等前面的命令。
+- 允许 `EA_RT=0` 关闭实时调度（无 root 或排查抖动时降级为普通调度）。
+
+**提供的操作**（全部投递即返回）：
+
+| 方法 | `data` | 返回 |
+| --- | --- | --- |
+| `action.motor.enable` | `{axis?}`（省略=全部轴） | `{"accepted":true}` |
+| `action.motor.stop` | `{axis?}` | `{"accepted":true,"estop":true}` |
+| `action.motor.move_abs` | `{axis, position}` | `{"accepted":true}` |
+| `action.motor.move_rel` | `{axis, delta}` | `{"accepted":true}` |
+| `action.motor.home` | `{axis?}` | `{"accepted":true}` |
+| `action.motor.set_velocity` | `{axis, velocity}`（counts/s，20000=1 圈/s） | `{"accepted":true}` |
+| `action.motor.read` | `{}` | `{"axes":[{axis,position,velocity,statusword,error,enabled}],"wkc":3,"cycles":N}` |
+
+`home` 是**软件置零**：MOONS 开环无原点传感器，不做机械回零；每次上电需人工把滑块放回起始端。
+
+**发出的事件**：
+
+| 事件 | 频率 | 是否进决策 |
+| --- | --- | --- |
+| `event.motor.status` | 10 Hz | **否**（在 `ignore` 列表，否则每秒 10 次 LLM 调用） |
+| `event.motor.reached` | 到位沿（false→true） | **否** |
+| `event.motor.alarm` | 伺服错误 / wkc 异常的上升沿 | **是** |
+
+**运行形态**：**原生进程**（非 Docker 容器）——硬实时需要 `SCHED_FIFO`、绑核、raw socket 与定向 `mlock`，容器化会引入 cgroup 调度配额与 `RT_GROUP_SCHED` EPERM 等额外变量。这偏离 §4.3「所有进程容器化」的一般约定，属本节的显式例外。
+
+**后端**：当前为 `MockBackend`（软件仿真，不驱动真实硬件），用于验证线程模型与协议契约；SOEM/EtherCAT 后端接入点是 `Backend` trait。接真实硬件时，复用 LinuxWasm 项目已验证的 `hal_ecat.c`（SOEM 封装 + RT pump）。
+
+**安全**：进程被 kill 时 MOONS 靠 EtherCAT 看门狗自停；`action.motor.stop` 是软件急停；RT 线程检测 wkc 连续异常应主动断使能（SOEM 后端接入时实现）。
+
 ## 9. 配置
 
 `config.json`（挂载到每个容器的 `/config/config.json`）**【固定：文件名；**<strong>`llm.api_url`</strong>**、**<strong>`llm.api_key`</strong>** 字段】**：
@@ -521,6 +574,8 @@ services:
     restart: unless-stopped
 ```
 
+`motor-ecat`（§8.8）**不在本 compose 中**：它作为原生进程单独启动（`deploy/run-motor.sh` 或 systemd 单元），原因见 §8.8「运行形态」。
+
 Wasm 容器中的进程只能看到 `/config`（只读），拿不到 `api_key` 以外的任何宿主资源——`config.json` 中的 `llm.api_key` 应通过一个只挂载给 `llm-gw` 的独立文件 `secrets/llm_key` 提供，`config.json` 里的 `api_key` 字段留空时网关回退读取该文件。**【提案】**
 
 ## 11. 端到端工作流程 **【固定：硬件进程生成结构化事件 → 运行时处理（规则 / LLM）→ 选择操作 → Action 消息发给系统进程，同时改变环境变量；交互后端产生统一的结构化事件，请求是事件，响应是操作】**
@@ -567,8 +622,9 @@ sequenceDiagram
 | **M2 运行时（Wasm）+ 规则** | `ea-wasmapi`、`runtime`，以 `wasmedge` 直接运行 | low 告警后 2 s 内 `heater.on` 变为 `true`，high 告警后变为 `false`；`event.runtime.decision` 的 `mode` 为 `rule` |
 | **M3 LLM 推理 + 任务进程** | `llm-gw`、`task-thermostat`，规则 `explain` | 对话框输入“把温度保持在 25 度”，30 s 内收到回复且 `task.hold_temp.enabled=true`，随后温度在 5 分钟内进入 25 ± 2 ℃ 并保持；清空 `rules` 后 low 告警仍能由 LLM 触发 `heater.start` |
 | **M4 Docker + WasmEdge 部署** | 镜像、compose、`host-setup.sh` | 在 Armbian 上 `docker compose up -d` 后，M1–M3 的全部验收项通过；`docker ps` 显示 `runtime` 与 `task-thermostat` 使用 `io.containerd.wasmedge.v1` |
+| **M5 实时运动控制（原生）** | `motor-ecat`（RT/RPC 线程分离 + 无锁命令环 + mock 后端），`ea-proto` 新增 `action.motor.*` / `event.motor.*` | `crates/bus/tests/m5.rs`：进程注册并登记全部 `action.motor.*`；`move_abs` 投递即返回（<500 ms）；`event.motor.reached` 在 5 s 内到达且位置正确；`motor.read` 读回快照；`motor.stop` 后断使能；参数非法返回 `INVALID_PARAMS` |
 
-后续扩展点（不在本期）：`spawner` 服务按需 `docker run` 任务进程；硬件进程接真实 Modbus / 串口；规则数量大时用 RAG 检索替代 `rules.json` 线性匹配；PREEMPT_RT 内核；Zephyr 侧的硬件进程通过串口以同样的 JSON-RPC 帧接入总线。
+后续扩展点（不在本期）：`spawner` 服务按需 `docker run` 任务进程；硬件进程接真实 Modbus / 串口；规则数量大时用 RAG 检索替代 `rules.json` 线性匹配；`motor-ecat` 的 SOEM 后端与 PID 位置环；Zephyr 侧的硬件进程通过串口以同样的 JSON-RPC 帧接入总线。
 
 ## 13. 给 Claude Code 的实施约束
 

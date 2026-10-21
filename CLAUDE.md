@@ -33,6 +33,11 @@
 - **wasm 容器不设 `restart`**：shim 停止路径缺陷（`docker stop`/`restart`/`compose restart` 会挂死 docker.service），故 runtime/task-thermostat 不设 restart 策略，崩溃后按全局 CLAUDE.md「wasm 容器硬规则」的安全流程重启。原生进程照常 `restart: unless-stopped`。
 - **设备无外网，LLM 验收策略**：R76S 无外网，`llm-gw` 无法访问云端 DeepSeek；M3 的 LLM 推理链路已在本机用 mock 端点（m3.rs）验证。设备上验收 M1/M2 及 M3 的规则/动作/任务本地路径；如需设备上全链路 LLM，可在 Mac 起 mock 端点并让设备 `config.json` 的 `llm.api_url` 指向它。
 - **web 端口 8090（非 8080）**：§9 写 web 监听 8080，但 R76S 的 8080/8081 已被 wasm-web 演示服务占用（host 网络）；event-agent 的 `web` 改用 `0.0.0.0:8090`，前端访问 `http://192.168.4.90:8090`。
+- **`motor-ecat` 是原生实时进程（非容器）**：§4.3 一般约定「所有进程容器化」，但硬实时需要 `SCHED_FIFO` + 绑核 + raw socket + **定向** `mlock`（严禁 `mlockall`，会破坏 AF_PACKET raw socket）。故 `motor-ecat` 以原生进程运行，不进 compose，见 DESIGN §8.8。
+- **`motor-ecat` 的 RT/RPC 线程分离**：RT 线程 4 ms PDO 循环只碰 IOmap（不分配/不加锁/不写日志/不做总线 I/O）；RPC 线程跑 tokio，收 `action.motor.*` 后经**无锁 SPSC 环**投递即返回，10 Hz 读快照发 `event.motor.status`。RT 线程永不等待 RPC。
+- **`event.motor.status` / `event.motor.reached` 必须进 `ignore`**：10 Hz 事件若走 LLM 推理会打爆上游；只有 `event.motor.alarm` 进决策。`rules.json` 与 `runtime` 的 `DEFAULT_IGNORE` 都要列。
+- **`client.connect` 的路由登记是第 4 个参数 `provide`（不是 `actions`）**：`actions` 只是 `sys.registry.actions` 的元数据；漏传 `provide` 时请求报 `-32601 no provider`。
+- **M5 后端当前是 mock**：`motor-ecat` 用 `MockBackend` 软件仿真（不驱动真实硬件），SOEM 后端接入点是 `Backend` trait；接真实 EtherCAT 时复用 LinuxWasm 已验证的 `hal_ecat.c`。
 
 ## 设备事实（2026-10-20 实测）
 
@@ -49,3 +54,4 @@
 - [x] M2 运行时 + 规则（ea-wasmapi / runtime）
 - [x] M3 LLM + 任务进程（llm-gw / task-thermostat）
 - [x] M4 Docker + WasmEdge 部署
+- [x] M5 实时运动控制（motor-ecat，RT/RPC 分离 + mock 后端）

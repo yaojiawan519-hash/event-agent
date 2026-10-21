@@ -37,6 +37,13 @@ pub mod event {
     pub const TASK_STARTED: &str = "event.task.started";
     pub const TASK_STOPPED: &str = "event.task.stopped";
     pub const RUNTIME_DECISION: &str = "event.runtime.decision";
+    // —— 实时运动控制（motor-ecat，M5）——
+    /// 周期状态快照（10 Hz，**不进决策**，见 rules.json 的 ignore）。
+    pub const MOTOR_STATUS: &str = "event.motor.status";
+    /// 某轴到达目标位置（由 RT 循环检测到 statusword bit10 上升沿后发出）。
+    pub const MOTOR_REACHED: &str = "event.motor.reached";
+    /// 伺服故障 / EtherCAT 工作计数异常（**进决策**）。
+    pub const MOTOR_ALARM: &str = "event.motor.alarm";
 }
 
 /// 操作方法名（action.*）。
@@ -48,6 +55,17 @@ pub mod action {
     pub const CHAT_REPLY: &str = "action.chat.reply";
     pub const TASK_START: &str = "action.task.start";
     pub const TASK_STOP: &str = "action.task.stop";
+    // —— 实时运动控制（motor-ecat，M5）——
+    // 全部动作是「投递即返回」（不等运动完成），完成靠 event.motor.reached 通知。
+    pub const MOTOR_ENABLE: &str = "action.motor.enable";
+    /// 急停：置零 + 断使能，走独立路径（不排队等前面的命令）。
+    pub const MOTOR_STOP: &str = "action.motor.stop";
+    pub const MOTOR_MOVE_ABS: &str = "action.motor.move_abs";
+    pub const MOTOR_MOVE_REL: &str = "action.motor.move_rel";
+    /// 开环步进无原点传感器：本动作把当前位置**软件置零**，不做机械回零。
+    pub const MOTOR_HOME: &str = "action.motor.home";
+    pub const MOTOR_SET_VELOCITY: &str = "action.motor.set_velocity";
+    pub const MOTOR_READ: &str = "action.motor.read";
 }
 
 /// JSON-RPC 2.0 错误码。

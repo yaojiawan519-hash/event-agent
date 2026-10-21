@@ -17,6 +17,9 @@ const DEFAULT_IGNORE: &[&str] = &[
     event::TEMPERATURE_UPDATED,
     event::HEARTBEAT_TICK,
     event::ENV_CHANGED,
+    // 高频运动状态不进决策（10 Hz 会打爆 LLM）；只有 alarm 走推理。
+    event::MOTOR_STATUS,
+    event::MOTOR_REACHED,
 ];
 const EVENT_WINDOW: usize = 20;
 const MAX_ROUNDS: u32 = 5;

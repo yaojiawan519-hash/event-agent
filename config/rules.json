@@ -2,7 +2,9 @@
   "ignore": [
     "event.temperature.updated",
     "event.heartbeat.tick",
-    "event.env.changed"
+    "event.env.changed",
+    "event.motor.status",
+    "event.motor.reached"
   ],
   "rules": [
     {
