@@ -1,0 +1,835 @@
+<title>event-agent 架构说明</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+
+<style>
+/* ============================================================
+   设计计划
+   颜色：暖灰纸面；琥珀=事件（广播），青=操作（点名），三层各有一个层色
+   字体：IBM Plex Sans（标题/正文）× IBM Plex Mono（进程名/报文），中文回落系统字体
+   布局：单栏正文，图与表可以横向溢出，三层用带层色的标题条区分
+   ============================================================ */
+:root {
+  --bg: #f8f7f4;
+  --surface: #ffffff;
+  --sunken: #f1f0ec;
+  --fg: #191a1d;
+  --muted: #5f6368;
+  --faint: #8a8e93;
+  --line: #dddbd4;
+  --line-strong: #c3c1b8;
+  --accent: #a8500a;
+  --accent-soft: #fbeee0;
+  --accent2: #0d6d84;
+  --accent2-soft: #e2f1f4;
+  --layer3: #6b4c9a;
+  --layer3-soft: #f0eaf7;
+  --alarm: #a71d1d;
+  --ok: #146c37;
+
+  --sans: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121317;
+    --surface: #191b20;
+    --sunken: #15171b;
+    --fg: #e9e9e4;
+    --muted: #a0a5ad;
+    --faint: #7b8089;
+    --line: #2d3037;
+    --line-strong: #3d414a;
+    --accent: #f0a869;
+    --accent-soft: #2a2117;
+    --accent2: #63c8dc;
+    --accent2-soft: #10262b;
+    --layer3: #b99ce6;
+    --layer3-soft: #221d2e;
+    --alarm: #f4807a;
+    --ok: #5cc98c;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #121317;
+  --surface: #191b20;
+  --sunken: #15171b;
+  --fg: #e9e9e4;
+  --muted: #a0a5ad;
+  --faint: #7b8089;
+  --line: #2d3037;
+  --line-strong: #3d414a;
+  --accent: #f0a869;
+  --accent-soft: #2a2117;
+  --accent2: #63c8dc;
+  --accent2-soft: #10262b;
+  --layer3: #b99ce6;
+  --layer3-soft: #221d2e;
+  --alarm: #f4807a;
+  --ok: #5cc98c;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 17px;
+  line-height: 1.75;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 740px;
+  margin: 0 auto;
+  padding-block: 56px 96px;
+}
+
+/* ---------- 页头 ---------- */
+.masthead { display: flex; flex-direction: column; gap: 18px; }
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--faint);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: center;
+}
+.eyebrow .dot { color: var(--line-strong); }
+
+h1 {
+  font-size: clamp(32px, 5.6vw, 46px);
+  line-height: 1.14;
+  letter-spacing: -0.02em;
+  font-weight: 600;
+  margin: 0;
+  text-wrap: balance;
+}
+
+h1 .file {
+  display: block;
+  font-family: var(--mono);
+  font-size: 0.36em;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+
+.lede {
+  font-size: 18.5px;
+  line-height: 1.68;
+  color: var(--muted);
+  margin: 0;
+  max-width: 60ch;
+}
+
+/* ---------- 章节 ---------- */
+section { margin-top: 60px; }
+
+.sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  border-top: 1px solid var(--line);
+  padding-top: 18px;
+  margin-bottom: 20px;
+}
+.sec-head .num {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent);
+  font-weight: 500;
+  flex: none;
+}
+h2 {
+  font-size: 24px;
+  line-height: 1.32;
+  letter-spacing: -0.01em;
+  font-weight: 600;
+  margin: 0;
+  text-wrap: balance;
+}
+
+h3 {
+  font-size: 17px;
+  font-weight: 600;
+  margin: 34px 0 10px;
+}
+
+p { margin: 0 0 16px; max-width: 66ch; }
+strong { font-weight: 600; }
+a { color: var(--accent2); text-underline-offset: 3px; }
+
+code {
+  font-family: var(--mono);
+  font-size: 0.87em;
+  background: var(--sunken);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.08em 0.34em;
+  word-break: break-word;
+}
+
+ul, ol { margin: 0 0 16px; padding-left: 1.3em; max-width: 66ch; }
+li { margin-bottom: 8px; }
+li::marker { color: var(--faint); }
+
+/* ---------- 三层 ---------- */
+.layer {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 18px 0;
+  background: var(--surface);
+}
+.layer-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.layer-head .tag {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.layer-head b { font-size: 16px; font-weight: 600; }
+.layer-head span.what { font-size: 13.5px; color: var(--muted); }
+.layer-body { padding: 16px 18px; }
+.layer-body p { font-size: 15px; margin-bottom: 10px; }
+.layer-body p:last-child { margin-bottom: 0; }
+
+.layer.l1 .layer-head { background: var(--accent2-soft); }
+.layer.l1 .tag { background: var(--accent2); color: var(--surface); }
+.layer.l2 .layer-head { background: var(--accent-soft); }
+.layer.l2 .tag { background: var(--accent); color: var(--surface); }
+.layer.l3 .layer-head { background: var(--layer3-soft); }
+.layer.l3 .tag { background: var(--layer3); color: var(--surface); }
+
+.members { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.members span {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--sunken);
+}
+
+/* ---------- 表 ---------- */
+.table-wrap { overflow-x: auto; margin: 20px 0; border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th {
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--muted);
+  background: var(--sunken); white-space: nowrap;
+}
+tr:last-child td { border-bottom: 0; }
+td:first-child { white-space: nowrap; }
+td code { font-size: 12.5px; }
+
+/* ---------- 报文框 ---------- */
+.frame {
+  margin: 20px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--sunken);
+}
+.frame-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px;
+  letter-spacing: 0.05em; color: var(--muted);
+}
+.chip {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em;
+  padding: 2px 7px; border-radius: 999px; flex: none;
+}
+.chip.ev { color: var(--accent); background: var(--accent-soft); }
+.chip.op { color: var(--accent2); background: var(--accent2-soft); }
+.frame pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto;
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.62;
+}
+.frame pre code { background: none; border: 0; padding: 0; font-size: inherit; white-space: pre; }
+
+/* ---------- 图 ---------- */
+figure { margin: 24px 0; }
+figure pre.mermaid {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 12px;
+  margin: 0;
+  overflow-x: auto;
+  text-align: center;
+}
+figcaption { font-size: 12.5px; color: var(--faint); margin-top: 9px; line-height: 1.6; }
+
+/* ---------- 提示块 ---------- */
+.note {
+  border-left: 3px solid var(--accent2);
+  background: var(--accent2-soft);
+  padding: 13px 17px;
+  border-radius: 0 8px 8px 0;
+  margin: 22px 0;
+  font-size: 15px;
+  line-height: 1.7;
+}
+.note p { margin: 0; max-width: none; }
+
+.steps { list-style: none; padding: 0; margin: 18px 0; counter-reset: s; }
+.steps li {
+  counter-increment: s;
+  position: relative;
+  padding-left: 44px;
+  margin-bottom: 12px;
+  font-size: 15.2px;
+  line-height: 1.65;
+}
+.steps li::before {
+  content: counter(s);
+  position: absolute; left: 0; top: 1px;
+  font-family: var(--mono); font-size: 12px; color: var(--accent2);
+  border: 1px solid var(--line-strong); border-radius: 5px;
+  width: 26px; height: 22px; display: grid; place-items: center;
+  background: var(--surface);
+}
+
+footer {
+  margin-top: 68px; padding-top: 22px;
+  border-top: 1px solid var(--line);
+  font-size: 13px; color: var(--faint); line-height: 1.75;
+}
+footer code { font-size: 12px; }
+
+@media (max-width: 480px) {
+  body { font-size: 16px; }
+  .page { padding-block: 34px 70px; }
+  section { margin-top: 46px; }
+  .layer-body { padding: 14px; }
+}
+</style>
+
+<div class="page">
+
+  <header class="masthead">
+    <div class="eyebrow">
+      <span>架构说明</span><span class="dot">/</span>
+      <span>NanoPi R76S</span><span class="dot">/</span>
+      <span>2026-10-22</span>
+    </div>
+    <h1><span class="file">event-agent</span>三层架构与消息流转</h1>
+    <p class="lede">
+      一套跑在 ARM 单板机上的事件驱动系统：三个层次、九个进程，
+      所有进程用同一种消息说话。本文说明每一层有什么、进程之间怎么传消息、
+      一个事件从产生到执行要经过哪些人。
+    </p>
+  </header>
+
+  <section>
+    <div class="sec-head"><span class="num">01</span><h2>系统要做什么</h2></div>
+
+    <p>
+      系统里有一堆硬件进程在干活：读温度、控加热器、驱动电机。
+      它们不断产生<strong>事件</strong>——温度超了、电机到位了、某个进程掉线了。
+      系统需要决定这些事件该怎么处理，然后发出<strong>操作</strong>去执行。
+    </p>
+
+    <p>
+      传统的做法是写一张「事件 → 操作」的对照表，事件来了就查表。
+      这套系统要试的是另一种做法：把这张表交给大模型，
+      让它看着当下的事件和上下文，现场判断该做什么。
+      对照表还在，只是变成了给模型看的规则和建议，而不是唯一的答案。
+    </p>
+
+    <p>
+      所以整个系统的核心问题就一句话：<strong>怎么让一个只会读文字、写文字的模型，
+      安全地看到系统里发生了什么，并且真的把事做成。</strong>
+      三条答案，就是三个层次。
+    </p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">02</span><h2>三层架构</h2></div>
+
+    <p>
+      三个层次按「谁更靠近物理世界」划分，不同的层有不同的限制条件：
+      底层要求时间确定，中层要求安全隔离，上层要求好用好改。
+    </p>
+
+    <figure>
+      <pre class="mermaid">
+graph TB
+  BR["浏览器<br/>对话 / 控制 / 仪表盘"]
+  CLOUD["云端大模型"]
+
+  subgraph SYS["① 系统进程层 · 原生 Linux 程序（5 个）"]
+    BUS["bus<br/>消息总线 + 环境存储"]
+    HW["hw-temp<br/>硬件进程"]
+    WEB["web<br/>网页后端"]
+    HB["heartbeat<br/>心跳"]
+    LLM["llm-gw<br/>大模型网关"]
+  end
+
+  subgraph AGENT["② AI 代理层 · Wasm 沙盒（3 个）"]
+    RT["runtime<br/>事件运行时"]
+    T1["task-thermostat<br/>恒温任务"]
+    T2["task-motor<br/>电机任务"]
+  end
+
+  subgraph RT3["③ 实时进程层 · 原生进程（1 个）"]
+    MC["motor-ecat<br/>4 毫秒周期"]
+  end
+
+  BR <-->|WebSocket| WEB
+  LLM <-->|HTTPS| CLOUD
+  HW <--> BUS
+  WEB <--> BUS
+  HB <--> BUS
+  LLM <--> BUS
+  RT <--> BUS
+  T1 <--> BUS
+  T2 <--> BUS
+  MC <-->|TCP| BUS
+  MC -.->|EtherCAT| DRIVE["电机驱动器"]
+      </pre>
+      <figcaption>
+        九个进程全部连到中间的 bus。任何两个进程都不直接对话，消息都经过总线转一次。
+      </figcaption>
+    </figure>
+
+    <h3>① 系统进程层：五个原生程序</h3>
+
+    <p>
+      这一层是普通的 Linux 程序，用 Rust 写成，装进 Docker 容器里跑。
+      它们负责和外部世界打交道——硬件、用户、云端模型——以及维护整个系统的秩序。
+    </p>
+
+    <div class="layer l1">
+      <div class="layer-head">
+        <span class="tag">原生</span><b>系统进程层</b>
+        <span class="what">硬件、用户、云端模型的出入口</span>
+      </div>
+      <div class="layer-body">
+        <p>
+          <code>bus</code> 是消息总线，也是唯一一个所有进程都要连的进程。
+          它给每个进程维护一个消息队列，负责把消息送到对的人手上，
+          顺便托管系统的「环境变量」——那些所有进程都关心的共享状态和历史数据。
+        </p>
+        <p>
+          <code>hw-temp</code> 是硬件进程，目前是温度模拟器：每秒算一次温度、
+          超阈值就发告警事件，对外提供「启动加热」「停止加热」「读温度」三个操作。
+          将来换真实传感器，只改它内部，外面不变。
+        </p>
+        <p>
+          <code>web</code> 是网页后端，也是系统和用户之间的翻译：外面的浏览器说普通 JSON，
+          系统里面说统一的消息格式，两边的话都由它转。
+        </p>
+        <p>
+          <code>heartbeat</code> 每两秒问一遍「谁还在」，发现进程掉线就发出事件——
+          这是系统知道「哪里出问题了」的唯一来源。
+        </p>
+        <p>
+          <code>llm-gw</code> 是大模型网关。整个系统里只有它拿着云端模型的密钥，
+          也只有它会发起对外的 HTTPS 请求。
+        </p>
+        <div class="members">
+          <span>bus</span><span>hw-temp</span><span>web</span><span>heartbeat</span><span>llm-gw</span>
+        </div>
+      </div>
+    </div>
+
+    <h3>② AI 代理层：三个 Wasm 任务</h3>
+
+    <p>
+      这一层是系统的「思考」和「执行」部分，跑在 Wasm 沙盒里（WasmEdge，由 Docker 管理）。
+      沙盒意味着严格限制：不能开线程，不能自己上网，不能读文件，
+      只有一条到总线的连接。它们能做的事，仅限于总线上有的操作。
+    </p>
+
+    <div class="layer l2">
+      <div class="layer-head">
+        <span class="tag">Wasm</span><b>AI 代理层</b>
+        <span class="what">决定做什么，以及怎么做完</span>
+      </div>
+      <div class="layer-body">
+        <p>
+          <code>runtime</code> 是事件运行时，系统的「大脑」。
+          它订阅所有事件，判断每个事件该怎么处理：有规则就用规则，
+          是用户在对话框里说的话就交给大模型推理，然后发出操作。
+          沙盒里没有别的进程能替它做这个判断。
+        </p>
+        <p>
+          <code>task-thermostat</code> 是恒温任务进程。
+          「保持 25 度」不是一个动作，而是一个要跑几十分钟的循环：
+          读温度、开或关加热器、再读温度。
+          这种活不能压在 runtime 身上，所以单独做成一个任务进程。
+        </p>
+        <p>
+          <code>task-motor</code> 是电机演示任务进程，同一类东西：
+          收到「让电机正转三圈再反转三圈」这样的指令后，自己编排步骤、
+          一步步调用电机操作，跑完报告结果。
+        </p>
+        <div class="members">
+          <span>runtime</span><span>task-thermostat</span><span>task-motor</span>
+        </div>
+      </div>
+    </div>
+
+    <h3>③ 实时进程层：一个实时程序</h3>
+
+    <p>
+      这一层只有一个进程，因为它没法待在容器里。
+      电机控制要求每 4 毫秒收发一次总线报文，任何一次调度延迟都可能让电机抖动甚至报错，
+      所以它需要操作系统的实时调度权限、需要独占总线网口、需要把内存锁住不被换页。
+      这些在容器里都做不到，于是它以普通系统服务的形式直接跑在板上。
+    </p>
+
+    <div class="layer l3">
+      <div class="layer-head">
+        <span class="tag">实时</span><b>实时进程层</b>
+        <span class="what">确定性优先，不接受延迟</span>
+      </div>
+      <div class="layer-body">
+        <p>
+          <code>motor-ecat</code> 守着一条 EtherCAT 总线，按固定周期驱动 MOONS 步进电机。
+          对外它提供「使能」「停止」「相对移动」「绝对定位」「设速度」这些操作，
+          用法和别的进程没什么不同——上层完全不必知道它是个实时程序。
+        </p>
+        <p>
+          它内部把自己分成两半：一半是那个雷打不动的 4 毫秒循环，只碰电机数据；
+          另一半负责收总线消息、回状态。命令进来放一个抽屉就返回，
+          循环自己在下个周期取走执行——实时的部分从不等人。
+        </p>
+        <div class="members"><span>motor-ecat</span></div>
+      </div>
+    </div>
+
+    <div class="note">
+      <p>
+        三层之外还有两个角色：<strong>浏览器</strong>是用户界面，
+        <strong>云端大模型</strong>是推理引擎。它们都不在系统内部，
+        分别通过 <code>web</code> 和 <code>llm-gw</code> 这两个门进出。
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">03</span><h2>九个进程一览</h2></div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>进程</th><th>层</th><th>形态</th><th>它发什么</th><th>它提供什么</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>bus</code></td><td>系统</td><td>容器</td><td>—</td><td>注册、环境读写、注册表查询</td></tr>
+          <tr><td><code>hw-temp</code></td><td>系统</td><td>容器</td><td>温度快照、告警、告警解除</td><td>加热器开关、读温度、设环境温度</td></tr>
+          <tr><td><code>web</code></td><td>系统</td><td>容器</td><td>用户发来的对话</td><td>回复对话</td></tr>
+          <tr><td><code>heartbeat</code></td><td>系统</td><td>容器</td><td>心跳、进程上线/掉线</td><td>—</td></tr>
+          <tr><td><code>llm-gw</code></td><td>系统</td><td>容器</td><td>—</td><td>调用大模型</td></tr>
+          <tr><td><code>runtime</code></td><td>AI 代理</td><td>Wasm</td><td>决策记录</td><td>—</td></tr>
+          <tr><td><code>task-thermostat</code></td><td>AI 代理</td><td>Wasm</td><td>任务开始/结束</td><td>启动/停止恒温任务</td></tr>
+          <tr><td><code>task-motor</code></td><td>AI 代理</td><td>Wasm</td><td>任务开始/结束</td><td>电机往返演示</td></tr>
+          <tr><td><code>motor-ecat</code></td><td>实时</td><td>原生进程</td><td>电机状态、到位、告警</td><td>使能、停止、移动、设速度</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      这张表的最后一列很重要：<strong>每个进程提供的操作，最终都会变成大模型手里的工具</strong>。
+      进程启动时把自己的操作名、一句中文描述和参数格式登记到总线上，
+      runtime 拿来拼成给模型的工具清单。所以给系统加一个新硬件能力，
+      模型就自动学会用它，中间不用改任何代码。
+    </p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">04</span><h2>消息怎么走</h2></div>
+
+    <p>
+      所有进程之间只有一条通道：连到 <code>bus</code> 的 TCP 连接。
+      没有谁直接连谁，没有中间件，也没有共享内存。
+      消息分两种，这也是整个架构里最要紧的一条规矩。
+    </p>
+
+    <h3>两种消息：事件和操作</h3>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>类型</th><th>是谁发的</th><th>去哪</th><th>会不会等回复</th><th>例子</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>事件</strong></td>
+            <td>任何进程</td>
+            <td>广播给所有关心它的人</td>
+            <td>不等</td>
+            <td>温度超过 60 度了</td>
+          </tr>
+          <tr>
+            <td><strong>操作</strong></td>
+            <td>需要别人做事时</td>
+            <td>只交给一个负责的进程</td>
+            <td>要等结果</td>
+            <td>把加热器关掉</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      一句话记住：<strong>事件是广播，谁爱听谁听；操作是点名，必须有人接。</strong>
+      事件丢了最多是少一次通知，操作没人接就是系统坏了——所以总线对这两种消息的待遇也不同：
+      队列满的时候先丢事件，操作不丢。
+    </p>
+
+    <p>
+      「点名」还带来一条约束：<strong>同一个操作只能有一个提供者</strong>。
+      第二个进程想提供已经有人认领的操作，注册时就会被拒绝。
+      这条看似苛刻的规则，保证了「谁负责」永远只有一个答案。
+    </p>
+
+    <div class="frame">
+      <div class="frame-bar"><span class="chip ev">事件</span>hw-temp 发出，所有订阅者收到</div>
+      <pre><code>{"method":"event.temperature.alarm",
+ "params":{"source":"hw-temp",
+           "data":{"level":"high","value":61.4,"threshold":60}}}</code></pre>
+    </div>
+
+    <div class="frame">
+      <div class="frame-bar"><span class="chip op">操作</span>runtime 请求，只有 hw-temp 会接</div>
+      <pre><code>{"id":"runtime-17","method":"action.heater.stop",
+ "params":{"source":"runtime","data":{}}}
+
+返回：{"id":"runtime-17","result":{"heater_on":false}}</code></pre>
+    </div>
+
+    <h3>总线上怎么找到对的人</h3>
+
+    <p>
+      没有地址簿，靠的是方法名的前缀。方法名统一写成「类别.领域.名称」，
+      比如 <code>event.temperature.alarm</code>、<code>action.heater.start</code>。
+      进程注册时声明两件事：我关心哪一类事件（订阅），我负责哪一类操作（提供）。
+    </p>
+
+    <ul>
+      <li><code>event.temperature.*</code> 表示「温度相关的所有事件」，在 <code>web</code> 这里就是它订阅的前缀。</li>
+      <li><code>action.heater.*</code> 表示「加热相关的所有操作」，由 <code>hw-temp</code> 独自提供。</li>
+      <li>发事件时匹配所有声明了这个前缀的进程，逐个投递；发操作时只找一个，找不到就回「没人负责」。</li>
+    </ul>
+
+    <p>
+      另外，每条消息的「发送者」字段由总线统一填写，进程自己说了不算。
+      否则任何进程都能冒充别人发事件。
+    </p>
+
+    <h3>三种跨越边界的连接</h3>
+
+    <p>
+      系统内部是一个样子，跨出边界就各有各的规矩。整个系统只有三处是这样：
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>两点之间</th><th>用什么</th><th>为什么是这样</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>浏览器 ↔ <code>web</code></td>
+            <td>WebSocket + 普通 JSON</td>
+            <td>浏览器不是系统进程，也没必要懂内部协议，所以由 <code>web</code> 负责翻译</td>
+          </tr>
+          <tr>
+            <td>Wasm 进程 ↔ <code>bus</code></td>
+            <td>同一条 TCP 连接</td>
+            <td>沙盒里只允许这一条网络连接，其余一律不通，这是隔离的代价也是保证</td>
+          </tr>
+          <tr>
+            <td><code>llm-gw</code> ↔ 云端</td>
+            <td>HTTPS</td>
+            <td>密钥和加密都只留在这一个进程里，沙盒接触不到</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <p>
+        沙盒里的进程其实和原生进程用的是同一套消息、同一套接口，
+        换一种语言或换一个平台，业务代码几乎不用改。这是「所有进程说同一种话」
+        带来的直接好处。
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">05</span><h2>两个完整流程</h2></div>
+
+    <h3>温度报警：一次广播，两条路</h3>
+
+    <figure>
+      <pre class="mermaid">
+sequenceDiagram
+  participant HW as hw-temp
+  participant BUS as bus
+  participant WEB as web
+  participant BR as 浏览器
+  participant RT as runtime
+  HW->>BUS: 事件：温度 61.4 度，高温告警
+  BUS-->>WEB: 广播
+  BUS-->>RT: 广播
+  WEB-->>BR: 页面变红，弹出告警
+  RT->>RT: 命中规则：高温应停加热器
+  RT->>BUS: 操作：停止加热
+  BUS->>HW: 投给它唯一的负责人
+  HW-->>BUS: 已停止
+  BUS-->>RT: 回执
+      </pre>
+      <figcaption>
+        注意告警显示和决策是两条独立的路：即使 runtime 或大模型挂了，页面上照样看得见告警。
+      </figcaption>
+    </figure>
+
+    <ol class="steps">
+      <li><code>hw-temp</code> 算出温度越过了 60 度，状态从「正常」变成「高温」，发一次告警事件。</li>
+      <li>总线把这条事件广播给所有订阅者：<code>web</code>、<code>runtime</code>、<code>heartbeat</code> 都在其中。</li>
+      <li><code>web</code> 立刻把它翻成网页能懂的形式推给浏览器——这一路完全不经过 runtime，
+        所以大模型再慢也不影响用户看到告警。</li>
+      <li><code>runtime</code> 按规则判断高温要停加热器，发出「停止加热」这个操作。</li>
+      <li>总线找到唯一负责这项操作的 <code>hw-temp</code>，把请求投过去，再把结果回给 runtime。</li>
+      <li><code>runtime</code> 记一条决策事件，说明这次是规则处理的。全程没有调用大模型。</li>
+    </ol>
+
+    <h3>用户说话：一次推理，派一个任务</h3>
+
+    <figure>
+      <pre class="mermaid">
+sequenceDiagram
+  participant BR as 浏览器
+  participant WEB as web
+  participant BUS as bus
+  participant RT as runtime
+  participant GW as llm-gw
+  participant T as task-thermostat
+  BR->>WEB: "把温度保持在 25 度"
+  WEB->>BUS: 事件：用户说了一句话
+  BUS-->>RT: 广播
+  RT->>BUS: 请求调用大模型
+  BUS->>GW: 转发
+  GW-->>RT: 让我启动恒温任务，目标 25 度
+  RT->>BUS: 操作：启动恒温任务
+  BUS->>T: 投递给任务进程
+  T-->>BUS: 开始了
+  T->>BUS: 事件：任务已开始
+  RT->>BUS: 操作：回复用户
+  BUS->>WEB: 投递
+  WEB-->>BR: 对话框里出现回复
+      </pre>
+      <figcaption>
+        模型能调用的只有各个进程登记过、系统里真实存在的操作，它编出来的名字会被直接拒绝。
+      </figcaption>
+    </figure>
+
+    <p>
+      大模型在这里的角色很明确：它只负责选操作、填参数。
+      真正的执行者是 <code>task-thermostat</code>，
+      它拿到目标温度后自己跑循环，读温度、开关加热器，跑完发一条结束事件。
+    </p>
+
+    <h3>不用模型：外部程序也能直接控制电机</h3>
+
+    <p>
+      系统的控制面不只给大模型用。任何程序连上 <code>web</code> 的
+      WebSocket 端口，就能直接发控制命令，发完立刻拿到回执，
+      电机位置再从每秒一次的状态推送里读。
+    </p>
+
+    <div class="frame">
+      <div class="frame-bar"><span class="chip op">WebSocket</span>任意客户端 → 设备 8090 端口</div>
+      <pre><code>→ {"type":"control","cmd":"motor.move_rel","delta":-60000}
+
+← {"type":"control_result","cmd":"motor.move_rel",
+   "ok":true,"result":{"accepted":true}}
+
+← {"type":"motor","state":{"axes":[
+     {"axis":0,"position":86170,"velocity":0,"enabled":true,"reached":true}]}}</code></pre>
+    </div>
+
+    <p>
+      这一路完全不经过 runtime 和大模型。20000 个微步是一圈，
+      所以上面这条命令是「逆时针转三圈」，实测三秒左右到位。
+      它说明了一件事：<strong>模型是系统的一种使用者，不是必经之路</strong>。
+    </p>
+  </section>
+
+  <section>
+    <div class="sec-head"><span class="num">06</span><h2>为什么分成三层</h2></div>
+
+    <p>
+      把进程按层摆放，不是为了好看，而是因为三层面对的限制根本不同。
+    </p>
+
+    <p>
+      <strong>系统进程层要的是秩序。</strong> 谁在线、消息送给谁、共享状态存在哪、
+      密钥归谁保管——这些问题必须有一个确定的答案，而且必须随时可用。
+      所以这一层用普通程序，跑在容器里，随系统起来。
+    </p>
+
+    <p>
+      <strong>AI 代理层要的是安全。</strong> 这一层的代码是给 AI 写、也由 AI 改的，
+      可信度天然低一档。把它关进 Wasm 沙盒，关掉网络、线程和文件系统，
+      只留一条到总线的连接，它就算写错也伤不到系统。代价是它什么都要走总线，
+      但这也正好保证了「系统里发生的一切都看得见」。
+    </p>
+
+    <p>
+      <strong>实时进程层要的是时间。</strong> 这一层的成败以微秒计，
+      任何一层抽象、任何一次内存分配都可能让电机抖一下。
+      所以它不进容器、不用异步框架、不参与事件广播的节奏，
+      自己按时钟转，只在对外的接口上装作一个普通进程。
+    </p>
+
+    <div class="note">
+      <p>
+        三层之间没有特殊通道，全部走总线。意味着<strong>越往上越自由、越往下越严格</strong>，
+        但彼此的边界始终是同一种消息——这正是这套架构能同时容纳
+        「大模型推理」和「4 毫秒闭环」的原因。
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <p>
+      仓库 <code>~/Documents/Arm2026/EmbeddedAgent</code> ·
+      设计文档 <code>docs/DESIGN.md</code> ·
+      原始需求 <code>Documents/事件驱动型智能体.md</code> ·
+      设备 NanoPi R76S（Armbian，aarch64）
+    </p>
+  </footer>
+
+</div>
