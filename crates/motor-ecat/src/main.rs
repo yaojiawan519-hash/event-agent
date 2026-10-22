@@ -399,6 +399,8 @@ mod soem {
     extern "C" {
         fn ea_ecat_init(ifname: *const std::os::raw::c_char) -> i32;
         fn ea_ecat_to_op(slave: i32) -> i32;
+        fn ea_ecat_al_state(idx: i32) -> i32;
+        fn ea_ecat_reop(slave: i32) -> i32;
         fn ea_ecat_shutdown();
         fn ea_ecat_slave(idx: i32, out: *mut EaSlave) -> i32;
         fn ea_ecat_pdo_cycle() -> i32;
@@ -449,6 +451,10 @@ mod soem {
         step_cycles: u8,
         /// 待写入 0x6081（轮廓速度）的值：RxPDO 里没有这个对象，只能走 SDO。
         pending_velocity: Option<i32>,
+        /// 「已请求使能但驱动器一直停在 Switch on disabled」的连续周期数。
+        /// 典型的成因是从站掉出了 OP（主站异常退出后驱动器 SM 看门狗触发），
+        /// 此时 RxPDO 根本没被应用，controlword 写得再对也没用——只能重新请求 OP。
+        stuck_cycles: u32,
     }
 
     impl Axis {
@@ -465,6 +471,7 @@ mod soem {
                 reset_cycles: 0,
                 step_cycles: 0,
                 pending_velocity: None,
+                stuck_cycles: 0,
             }
         }
     }
@@ -473,6 +480,10 @@ mod soem {
         slaves: Vec<Slave>,
         axes: [Axis; MAX_AXES],
         n: usize,
+        /// 周期计数（只为「重进 OP」的冷却计时用）。
+        cycle_no: u64,
+        /// 上次尝试重进 OP 的周期号（0 = 从未），冷却 10 s = 2500 周期。
+        last_reop: u64,
     }
 
     // SAFETY: 后端只在单个 RT 线程内使用；裸指针来自 SOEM 的 IOmap，
@@ -568,7 +579,13 @@ mod soem {
                 }
             }
 
-            Ok(SoemBackend { slaves, axes: std::array::from_fn(|_| Axis::new()), n })
+            Ok(SoemBackend {
+                slaves,
+                axes: std::array::from_fn(|_| Axis::new()),
+                n,
+                cycle_no: 0,
+                last_reop: 0,
+            })
         }
 
         fn each_axis(&mut self, axis: usize, mut f: impl FnMut(&mut Axis)) {
@@ -578,6 +595,33 @@ mod soem {
                 }
             } else if axis < self.n {
                 f(&mut self.axes[axis]);
+            }
+        }
+
+        /// 使能请求有效、驱动器却 2 s 不响应 → 把从站重新推回 OP。
+        ///
+        /// 这是**故障恢复路径**：`ea_ecat_reop` 内部会重跑 SAFE_OP→OP 与若干拍 PDO，
+        /// 阻塞几十到几百毫秒，也会打日志（分配/加锁）。因此只在判定卡住时触发，
+        /// 且冷却 10 s，正常运行时这条路径一次都不会进。
+        fn recover_if_stuck(&mut self) {
+            let Some(i) = (0..self.n).find(|&i| self.axes[i].stuck_cycles > 500) else { return };
+            if self.last_reop != 0 && self.cycle_no.wrapping_sub(self.last_reop) < 2500 {
+                return;
+            }
+            self.last_reop = self.cycle_no;
+            let al = unsafe { ea_ecat_al_state(i as i32) };
+            warn!(
+                "[soem] slave {i} 使能无响应（AL state={al}，2 s 停在 Switch on disabled）——重新请求 OP"
+            );
+            let rc = unsafe { ea_ecat_reop((i + 1) as i32) };
+            if rc == 0 {
+                let a = &mut self.axes[i];
+                a.enable_step = 0;
+                a.step_cycles = 0;
+                a.stuck_cycles = 0;
+                info!("[soem] slave {i} 已重新进入 OP");
+            } else {
+                warn!("[soem] slave {i} 重进 OP 失败，错误码 {rc}");
             }
         }
     }
@@ -749,6 +793,7 @@ mod soem {
 
         fn cycle(&mut self) -> CycleOut {
             let mut out = CycleOut { wkc: 0, ..Default::default() };
+            self.cycle_no = self.cycle_no.wrapping_add(1);
 
             // 1) 写 RxPDO（必须先写再发）。
             for i in 0..self.n {
@@ -819,8 +864,20 @@ mod soem {
                 // CiA402：0x27 = Operation enabled
                 out.enabled[i] = ax.enabled && (sw & 0x0027) == 0x0027;
                 out.reached[i] = ax.enabled && (sw & 0x0400) != 0;
+
+                // 「请求了使能，驱动器却一直停在 Switch on disabled（bit6=1）」
+                // 说明 RxPDO 根本没被应用——最常见的原因是从站掉出了 OP
+                //（主站异常退出后驱动器 SM 看门狗触发，真机 2026-10-22 踩过：
+                //  使能一直返回 accepted，轴却纹丝不动，只有重启进程才好）。
+                // 这个判定只用已经读回来的 TxPDO，零额外总线开销。
+                if ax.enabled && (sw & 0x0027) != 0x0027 && (sw & 0x0040) != 0 {
+                    ax.stuck_cycles = ax.stuck_cycles.saturating_add(1);
+                } else {
+                    ax.stuck_cycles = 0;
+                }
             }
 
+            self.recover_if_stuck();
             out
         }
 

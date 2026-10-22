@@ -34,6 +34,15 @@ int ea_ecat_init(const char *ifname);
 /* 把从站（1-based）推到 OP。返回 0 成功，负值为错误码。 */
 int ea_ecat_to_op(int slave);
 
+/* 从站的 AL 状态（SOEM 缓存值，不产生总线流量）。idx 为 0-based；失败返回负错误码。
+ * 2=INIT 4=SAFE_OP 8=OP */
+int ea_ecat_al_state(int idx);
+
+/* 从站掉出 OP（常见于主站异常退出后驱动器 SM 看门狗触发）后重新请求 OP。
+ * 内部会重新走 SAFE_OP→OP 并跑若干拍 PDO，**会阻塞几十到几百毫秒**，
+ * 只应在故障恢复路径里调用。slave 为 1-based。返回 0 成功。 */
+int ea_ecat_reop(int slave);
+
 /* 全部从站回到 INIT 并释放主站。 */
 void ea_ecat_shutdown(void);
 

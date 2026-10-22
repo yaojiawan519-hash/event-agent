@@ -497,6 +497,7 @@ bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 - **`--sdo --ifname <dev>`** 是第二站：在 PRE_OP 下把对象字典打出来（0x603F/6040/6041/6060/6061/6064/607A/6081/6083/6084 + 0x1C12/0x1C13 的 PDO 分配与 0x1600/0x1A00 映射明细），同样**不进 OP、不使能**。用来回答「映射对不对」「速度参数是不是 0」「驱动器锁了什么故障」。
 - **轮廓参数走 SDO，不走 PDO**：MOONS 默认 RxPDO 里没有 0x6081，PP 模式的轮廓速度只能靠 CoE 写。约定是：`SoemBackend::new` 在 **PRE_OP**（此时邮箱可用、PDO 尚未生效）读 0x6081/83/84，**只补零值**不覆盖驱动器设定；运行期 `action.motor.set_velocity` 由 `Backend::service()` 钩子在命令到达的那一拍发一次 SDO（1–10 ms，会让该周期超时一次；参数设置极少发生，比每周期轮询代价小）。
 - **优雅停机是硬要求**：`main` 收 SIGINT/SIGTERM 后先置 `shared.shutdown`、`join` RT 线程，让 `SoemBackend::drop` 调 `ea_ecat_shutdown()` 把从站切回 INIT。**直接 `kill -9` 会让驱动器锁存 `0x7500` 通讯故障并闪红灯**（只能断电或在使能时发 `0x0080` 复位）。
+- **从站掉出 OP 的自愈**：主站异常退出（崩溃、`kill -9`、机器重启）后，驱动器侧 SM 看门狗会把从站拉出 OP，此后 **RxPDO 根本不被应用**——`action.motor.enable` 照常返回 `{"accepted":true}`，`0x6081` 也写得进去，轴却纹丝不动，只有重启整个进程才能恢复（真机 2026-10-22 踩过，误判为「使能没生效」排查了很久）。现在 RT 线程用**已经读回来的 TxPDO** 判：`已请求使能 && (sw & 0x0027) != 0x0027 && (sw & 0x0040) != 0` 连续 2 s（500 周期）即视为卡在 Switch on disabled，调 `ea_ecat_reop()` 重新走 SAFE_OP→OP，并把该轴使能序列归零重来。冷却 10 s（2500 周期）防抖，正常运行时这条路径一次都不进；判定零额外总线开销。`ea_ecat_al_state()` 暴露 SOEM 缓存的 AL 状态供日志诊断，不产生总线流量。⚠️ 已构建部署到真机并正常运行，但**「卡住→自愈」的完整循环尚未在真机上复现**（该状态需要主站异常退出而进程不重启，属于偶发故障路径）。
 - 交叉编译（Mac → aarch64）：用 `r2s-build` 容器 `cargo build -p motor-ecat`。⚠️ **务必设 `CARGO_TARGET_DIR`** 指向容器内路径，否则会覆盖 Mac 的 `target/`（本机二进制变成 Linux ELF，后续本机测试全乱）。
 
 **真机实测（2026-10-22，R76S end1 + 1 台 MOONS STF06-ECX-mini）**：

@@ -107,6 +107,19 @@ int ea_ecat_to_op(int slave)
     return EA_ECAT_ERR_STATE;
 }
 
+int ea_ecat_al_state(int idx)
+{
+    if (!g_ctx) return EA_ECAT_ERR_ARG;
+    if (idx < 0 || idx >= g_slave_count) return EA_ECAT_ERR_ARG;
+    return g_ctx->slavelist[idx + 1].state;
+}
+
+int ea_ecat_reop(int slave)
+{
+    if (!g_ctx) return EA_ECAT_ERR_STATE;
+    return ea_ecat_to_op(slave);
+}
+
 void ea_ecat_shutdown(void)
 {
     if (!g_ctx) return;
