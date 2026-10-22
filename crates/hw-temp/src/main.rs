@@ -157,13 +157,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("hw-temp connected to {addr}");
 
     let mut sim = Sim::new();
+    // 采样 1 s 一拍（告警判定与 env 更新靠它），但 `event.temperature.updated`
+    // **按 `EA_STATUS_REPORT_MS` 节流**（默认 3 分钟）——这条事件会进 Agent 视野，
+    // 1 Hz 上报只会淹没对话。网页要实时温度就走 `action.temperature.read`。
+    let report_every = status_report_ticks();
+    info!("温度事件上报每 {report_every} 个采样周期（EA_STATUS_REPORT_MS）");
+    let mut tick_count: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                sample(&client, &mut sim).await;
+                tick_count = tick_count.wrapping_add(1);
+                // 首拍先报一次（网页/测试不用等满一个周期），之后按周期节流。
+                let report = tick_count == 1 || tick_count % report_every == 0;
+                sample(&client, &mut sim, report).await;
             }
             msg = client.next() => {
                 match msg {
@@ -179,20 +188,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn sample(client: &Client, sim: &mut Sim) {
+/// 上报周期换算成「1 s 采样拍数」。`EA_STATUS_REPORT_MS` 默认 180000（3 分钟）。
+fn status_report_ticks() -> u64 {
+    let ms = std::env::var("EA_STATUS_REPORT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(180_000);
+    (ms / 1000).max(1)
+}
+
+async fn sample(client: &Client, sim: &mut Sim, report: bool) {
     let prev_alarm = sim.alarm;
     sim.step();
     let value = sim.temperature;
     let heater_on = sim.heater_on;
     let state = sim.alarm.as_str();
 
-    client
-        .emit(
-            event::TEMPERATURE_UPDATED,
-            json!({"value": value, "heater_on": heater_on, "state": state}),
-        )
-        .await
-        .ok();
+    if report {
+        client
+            .emit(
+                event::TEMPERATURE_UPDATED,
+                json!({"value": value, "heater_on": heater_on, "state": state}),
+            )
+            .await
+            .ok();
+    }
 
     let _ = client.env_set("temperature.current", json!(value), true).await;
     let _ = client.env_set("temperature.state", json!(state), false).await;

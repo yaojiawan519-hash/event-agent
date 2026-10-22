@@ -512,7 +512,21 @@ async fn m3_empty_rules_llm_fallback() {
     .await;
     assert!(low.is_some(), "expected low alarm");
 
-    // 无规则命中 → LLM 决策开加热器。
+    // 契约（真机教训后收紧）：**事件本身不触发 LLM**，只有用户在对话里提问才推理。
+    // 空规则下 low 告警因此不会有任何决策，加热器保持关闭。
+    let quiet = wait_for_event(&client, Duration::from_secs(3), |m, d| {
+        m == event::RUNTIME_DECISION && d.get("mode").and_then(|v| v.as_str()) == Some("llm")
+    })
+    .await;
+    assert!(quiet.is_none(), "event-only path must not invoke the LLM any more");
+    wait_heater_on(&client, false, "low alarm without chat").await;
+
+    // 用户在对话里问起（工具调用由 mock 按关键字 "low" 决定）→ 才走 LLM 并开加热器。
+    client
+        .emit(event::CHAT_MESSAGE, json!({"session": "s1", "text": "检测到 low 告警，请开启加热器"}))
+        .await
+        .expect("emit chat");
+
     let d = wait_for_event(&client, Duration::from_secs(10), |m, d| {
         m == event::RUNTIME_DECISION
             && d.get("mode").and_then(|v| v.as_str()) == Some("llm")
@@ -524,5 +538,5 @@ async fn m3_empty_rules_llm_fallback() {
     .await;
     assert!(d.is_some(), "expected llm decision with action.heater.start");
 
-    wait_heater_on(&client, true, "low alarm via llm").await;
+    wait_heater_on(&client, true, "low alarm via chat").await;
 }

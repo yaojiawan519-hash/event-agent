@@ -32,10 +32,14 @@
 - **runtime 规则在设备上 baked-in**：wasm 镜像把 `config/rules.json` 打进 `/rules.json`（runtime 以 `--rules /rules.json` 读取）；不把 config 目录作为 WASI preopen 挂载进 wasm 容器（runwasi shim 对 bind mount 的 preopen 未验证）。读不到时回退硬编码默认（内容一致，行为不变）。
 - **wasm 容器不设 `restart`**：shim 停止路径缺陷（`docker stop`/`restart`/`compose restart` 会挂死 docker.service），故 runtime/task-thermostat 不设 restart 策略，崩溃后按全局 CLAUDE.md「wasm 容器硬规则」的安全流程重启。原生进程照常 `restart: unless-stopped`。
 - **设备无外网，LLM 验收策略**：R76S 无外网，`llm-gw` 无法访问云端 DeepSeek；M3 的 LLM 推理链路已在本机用 mock 端点（m3.rs）验证。设备上验收 M1/M2 及 M3 的规则/动作/任务本地路径；如需设备上全链路 LLM，可在 Mac 起 mock 端点并让设备 `config.json` 的 `llm.api_url` 指向它。
+- **只有聊天事件进 LLM（2026-10-22 收紧）**：`dispatch` 只对 `event.chat.message` 调推理，其余事件仅进 history 作上下文；`rules.json` 的 `explain` 保留解析但不再生效。原因：单线程 runtime 被高频事件牵进 10~30 s 的推理会就地堵死（真机实测聊天要等 2 分钟）。`crates/bus/tests/m3.rs::m3_empty_rules_llm_fallback` 已按新契约改写（先断言事件路径**不**调 LLM，再发聊天触发）。
+- **周期快照按 `EA_STATUS_REPORT_MS` 节流（默认 180000 = 3 分钟）**：`event.motor.status`（motor-ecat）与 `event.temperature.updated`（hw-temp）都读这个环境变量；compose 里 `hw-temp` 用 `environment:` 传，`motor-ecat.service` 用 `Environment=` 传。**告警不走这个周期**——它们由 250 ms 的边沿检测抓，且同一 key（`servo:<轴>:<码>` / `wkc:<实得>:<期望>`）只发一次，恢复时发一次 `event.motor.alarm_cleared`。`motor-ecat` 刚启动时 `expect_wkc` 还是 0（未标定），此时**不发 wkc 告警**（否则每次重启都白烧一次推理），宽限 30 s。
+- **测试对话链路必须发「通知」而不是「请求」**：`event.chat.message` 走 `client.emit(...)`（无 id 的 notification）；写成 `call(...)` 会因总线上没有该方法的 provider 被拒，表现成「发了消息电机毫无反应」，很容易误判成 LLM 或电机的问题（真机踩过）。`crates/bus/tests/m3.rs` 用 `emit`，`target/ea_chat_probe.py` 已按此修正。
+- **网页实时性靠 web 自己轮询**：`web` 每 1 s 调 `action.motor.read` / `action.temperature.read` 推给浏览器（`{"type":"motor"|"temperature_read"}`），所以仪表盘是秒级刷新，与上面的事件节流无关；`motor-ecat` 掉线 5 s 后页面标「无响应」。
+- **`event.motor.status` / `event.motor.reached` 必须进 `ignore`**：10 Hz 事件（现已节流）若走 LLM 推理会打爆上游；只有 `event.motor.alarm` 进决策。`rules.json` 与 `runtime` 的 `DEFAULT_IGNORE` 都要列，且 `load_rules` 会把两者**取并集**（rules.json 打包进镜像，容易过期）。
 - **web 端口 8090（非 8080）**：§9 写 web 监听 8080，但 R76S 的 8080/8081 已被 wasm-web 演示服务占用（host 网络）；event-agent 的 `web` 改用 `0.0.0.0:8090`，前端访问 `http://192.168.4.90:8090`。
 - **`motor-ecat` 是原生实时进程（非容器）**：§4.3 一般约定「所有进程容器化」，但硬实时需要 `SCHED_FIFO` + 绑核 + raw socket + **定向** `mlock`（严禁 `mlockall`，会破坏 AF_PACKET raw socket）。故 `motor-ecat` 以原生进程运行，不进 compose，见 DESIGN §8.8。
 - **`motor-ecat` 的 RT/RPC 线程分离**：RT 线程 4 ms PDO 循环只碰 IOmap（不分配/不加锁/不写日志/不做总线 I/O）；RPC 线程跑 tokio，收 `action.motor.*` 后经**无锁 SPSC 环**投递即返回，10 Hz 读快照发 `event.motor.status`。RT 线程永不等待 RPC。
-- **`event.motor.status` / `event.motor.reached` 必须进 `ignore`**：10 Hz 事件若走 LLM 推理会打爆上游；只有 `event.motor.alarm` 进决策。`rules.json` 与 `runtime` 的 `DEFAULT_IGNORE` 都要列。
 - **`client.connect` 的路由登记是第 4 个参数 `provide`（不是 `actions`）**：`actions` 只是 `sys.registry.actions` 的元数据；漏传 `provide` 时请求报 `-32601 no provider`。
 - **M5 双后端**：`MockBackend`（全平台，默认，m5.rs 用它）与 `SoemBackend`（仅 Linux，`--ifname` 启用）。SOEM 2.0.0 已 vendor 进 `crates/motor-ecat/vendor/soem/`，由 `build.rs` + `cc`（build-dependency）编译，非运行时依赖；⚠️ SOEM 是 GPLv3/商业双许可，按 GPLv3 用。接硬件先跑 `--probe --ifname end1`（只读探测，不使能伺服）。
 - **M5 真机实测的三个坑（2026-10-22，R76S end1 + 1 台 MOONS）**：

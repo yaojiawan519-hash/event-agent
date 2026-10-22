@@ -369,17 +369,18 @@ connect → register(subscribe=["event.*"]) → loop { msg = next(); dispatch(ms
 
 `dispatch` 的决策顺序：
 
-1. 过滤：`event.temperature.updated`、`event.heartbeat.tick`、`event.env.changed` 默认不进入决策（只更新本地缓存），避免 1 Hz 事件反复触发推理。可在 `rules.json` 的 `ignore` 列表中调整。
+1. 过滤：`event.temperature.updated`、`event.heartbeat.tick`、`event.env.changed`、`event.motor.status`、`event.motor.reached`、`event.task.*`、`event.process.*` 默认不进入决策（只更新本地缓存）。**内置 ignore 永远与 `rules.json` 的 ignore 取并集**——rules.json 是打包进镜像的，很容易比二进制旧（真机上就出现过旧文件缺 motor 项，让 10 Hz 快照全走推理）。
 
-2. 规则匹配：按 `rules.json` 顺序匹配第一条命中的规则，执行其 `then` 中的操作（通过 `call`，依次串行）。若规则含 `"explain": true`，再把事件、规则与操作结果交给 LLM 生成一句面向用户的说明，经 `action.chat.reply` 显示。
+2. 规则匹配：按 `rules.json` 顺序匹配第一条命中的规则，执行其 `then` 中的操作（通过 `call`，依次串行）。
 
-3. 无规则命中：进入 LLM 推理（下一节）。
+3. **只有 `event.chat.message` 才进入 LLM 推理**（下一节）。其余事件即使没有规则命中也不推理：单线程 runtime 一旦被高频事件牵进 10~30 s 的推理，整个 Agent 就地堵死。`rules.json` 的 `explain` 字段保留解析但不再生效（不再为告警额外调一次 LLM）。
 
 4. 每次决策（无论规则或 LLM）向总线发 `event.runtime.decision {event_method, mode:"rule"|"llm", actions:[...]}`，作为可观测性记录。
 
 LLM 推理回合：
 
-- 上下文 = 系统提示（角色说明 + 可用操作清单，来自 `sys.registry.actions`）+ `env.snapshot` + 最近 20 条事件（本地环形缓冲）+ 触发事件本身 + 若为聊天事件则包含用户文本。
+- 上下文 = 系统提示（角色说明 + 可用操作清单，来自 `sys.registry.actions`）+ `env.snapshot` + 现读的 `action.motor.read` 电机快照 + 最近 20 条事件（本地环形缓冲）+ 用户文本。
+  （周期快照被节流到 3 分钟，聊天时现读一次，避免模型拿旧位置回答。）
 
 - 工具 = 全部 `action.*` 的 `ActionSpec`，另加一个虚拟工具 `task.start {task, params}` 映射为 `action.task.start`。
 
@@ -403,7 +404,7 @@ LLM 推理回合：
 }
 ```
 
-`event.chat.message` 与 `event.process.down` 没有规则，因此总是走 LLM。把 `rules` 清空即可演示“完全由 LLM 推理决定”的模式，两种模式对照正是原文的核心论点。
+`event.chat.message` 没有规则，因此总是走 LLM；`rules` 清空即演示“完全由 LLM 推理决定”的模式。注意 2026-10-22 收紧后，**非聊天事件不再进 LLM**，所以两种模式的对照要经由对话发起。
 
 ### 8.7 `task-thermostat`：任务进程（Wasm） **【固定：复杂异步循环操作由任务进程完成，任务进程是一个大功能块】**
 
@@ -424,7 +425,8 @@ LLM 推理回合：
 ```text
 bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
                        · 收 action.motor.*，投递命令后立即应答
-                       · 按 10 Hz 读快照发 event.motor.status / reached / alarm
+                       · 250 ms 查边沿发 reached / alarm（翻转才发）
+                       · 按 EA_STATUS_REPORT_MS（默认 3 min）发 event.motor.status 快照
                              │  命令环（无锁 SPSC，AtomicU64 槽，定长）
                              │  状态快照（原子字段，无锁）
                        RT 线程（SCHED_FIFO 80 + 绑 CPU + 定向 mlock）
@@ -457,9 +459,25 @@ bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 
 | 事件 | 频率 | 是否进决策 |
 | --- | --- | --- |
-| `event.motor.status` | 10 Hz | **否**（在 `ignore` 列表，否则每秒 10 次 LLM 调用） |
-| `event.motor.reached` | 到位沿（false→true） | **否** |
-| `event.motor.alarm` | 伺服错误 / wkc 异常的上升沿 | **是** |
+| `event.motor.status` | **`EA_STATUS_REPORT_MS`**（默认 180000 = 3 分钟） | **否**（在 `ignore` 列表） |
+| `event.motor.reached` | 到位沿（false→true），250 ms 检测 | **否** |
+| `event.motor.alarm` | 告警沿：**同一 key（类别+轴+错误码）只发一次**，250 ms 检测 | **是** |
+| `event.motor.alarm_cleared` | 与 alarm 成对的恢复沿 | **是** |
+
+**状态上报节流（用户要求，2026-10-22）**：告警/温度快照这类周期性事件对 Agent 是噪音——
+单线程 runtime 一旦被 10 Hz 快照牵进 LLM 推理就会堵死（真机实测网页聊天要等 2 分钟）。
+因此：
+
+- 周期快照的周期由环境变量 `EA_STATUS_REPORT_MS` 统一控制（毫秒，默认 `180000`）：
+  `motor-ecat` 的 `event.motor.status`、`hw-temp` 的 `event.temperature.updated` 都读它；
+  compose 里 `hw-temp` 用 `environment:` 传入，`motor-ecat` 用 systemd `Environment=` 传入。
+- **同类报警只更新不重报**：`motor-ecat` 用 `servo:<轴>:<错误码>` / `wkc:<实得>:<期望>` 作 key，
+  key 不变就不发新事件，恢复时才发一次 `alarm_cleared`。告警走独立的 250 ms 边沿检测，
+  **不受** `EA_STATUS_REPORT_MS` 影响（否则告警最迟要等 3 分钟才到）。
+- **LLM 只在对话里被提问时调用**：`runtime` 只对 `event.chat.message` 走推理，其它事件
+  仅进 history 作为上下文。确定性动作（高温→停加热器）仍由规则完成，不消耗推理。
+- **网页显示的实时性不靠这些事件**：`web` 自己按 1 s 轮询 `action.motor.read` /
+  `action.temperature.read` 推给浏览器（纯总线 RPC，不碰 LLM），仪表盘因此仍是秒级刷新。
 
 **运行形态**：**原生进程**（非 Docker 容器）——硬实时需要 `SCHED_FIFO`、绑核、raw socket 与定向 `mlock`，容器化会引入 cgroup 调度配额与 `RT_GROUP_SCHED` EPERM 等额外变量。这偏离 §4.3「所有进程容器化」的一般约定，属本节的显式例外。
 

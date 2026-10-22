@@ -19,6 +19,10 @@ services:
     volumes:
       - ./config:/config:ro
     depends_on: [bus]
+    # 环境快照（event.temperature.updated）的上报周期，默认 3 分钟。
+    # 告警的「进入/解除」不受此限——它们只在状态翻转时发一次。
+    environment:
+      - EA_STATUS_REPORT_MS=${EA_STATUS_REPORT_MS:-180000}
     restart: unless-stopped
 
   web:

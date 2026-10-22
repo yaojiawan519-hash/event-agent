@@ -1,0 +1,29 @@
+[Unit]
+Description=event-agent motor-ecat（EtherCAT 实时运动控制进程）
+Documentation=file:/home/yao/event-agent/DESIGN-8.8
+# 总线由 docker compose 起；motor-ecat 连不上总线会退出重试，故不必强依赖。
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# 硬实时要求：CAP_NET_RAW（AF_PACKET raw socket）、SCHED_FIFO、定向 mlock。
+ExecStart=/home/yao/event-agent/bin/motor-ecat --bus 127.0.0.1:7700 --ifname end1
+WorkingDirectory=/home/yao/event-agent
+# 必须是 SIGTERM（默认）：进程收到后 join RT 线程、从站回 INIT。
+# 用 SIGKILL 会让 MOONS 锁存 0x7500 通讯故障并闪红灯。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=2
+# RT 线程会把自己迁到根 cgroup（解 CONFIG_RT_GROUP_SCHED 的配额），
+# 故不设任何 CPU 配额限制。
+LimitMEMLOCK=infinity
+Environment=RUST_LOG=info
+# 周期状态快照（event.motor.status）的上报周期，默认 3 分钟。
+# 报警只在「类别+轴+错误码」变化时上报一次，不受此周期影响。
+Environment=EA_STATUS_REPORT_MS=180000
+
+[Install]
+WantedBy=multi-user.target

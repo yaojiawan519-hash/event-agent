@@ -1,0 +1,19 @@
+[Unit]
+Description=event-agent docker compose 栈（bus/web/llm-gw + wasm 服务）
+Documentation=file:/home/yao/event-agent/docker-compose.yml
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/yao/event-agent
+# --no-recreate：容器已在跑（含 Docker 按 restart 策略自动拉起的原生进程）时不要动它们。
+# ⚠️ wasm 容器绝不能 stop/restart（shim 停止路径会挂死 docker.service），
+#    故它们不设 restart 策略，开机只能靠本单元 `up -d` 拉起来。
+ExecStart=/usr/bin/docker compose up -d --no-recreate
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

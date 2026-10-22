@@ -154,6 +154,20 @@
     font-size: 12px; color: var(--muted); margin: 16px 0 6px;
     text-transform: uppercase; letter-spacing: .05em;
   }
+
+  /* 电机状态（网页自己 1 s 轮询 action.motor.read，不经过 LLM） */
+  #motor-axes { display: flex; flex-direction: column; gap: 6px; }
+  .ax {
+    display: grid; grid-template-columns: 44px 1fr 1fr 1fr;
+    gap: 8px; align-items: center;
+    background: #f8fafc; border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 10px; font-size: 13px;
+  }
+  .ax .name { font-weight: 600; }
+  .ax .cell { display: flex; flex-direction: column; gap: 2px; }
+  .ax .cell .k { font-size: 11px; color: var(--muted); }
+  .ax .cell .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  #motor-foot { font-size: 11px; color: var(--muted); margin-top: 6px; }
   #proc-list { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
   .chip.up { background: var(--ok-soft); color: var(--ok); }
@@ -244,6 +258,9 @@
         <div class="stat"><div class="k">在线进程</div><div class="v" id="proc-count">0</div></div>
       </div>
       <div id="alarm-banner"><span>⚠️</span><span id="alarm-banner-text"></span></div>
+      <div class="section-title">电机状态</div>
+      <div id="motor-axes"><span class="muted">未连接</span></div>
+      <div id="motor-foot"></div>
       <div class="section-title">进程状态</div>
       <div id="proc-list"><span class="muted">无</span></div>
       <div class="section-title">最近事件</div>
@@ -256,7 +273,7 @@
     <h2>AI 对话</h2>
     <div id="chat-log"></div>
     <div class="chat-foot">
-      <textarea id="chat-input" rows="1" placeholder="输入消息…（M3 接入 LLM 后可用）"></textarea>
+      <textarea id="chat-input" rows="1" placeholder="例如：演示电机，10次顺时针，10次逆时针"></textarea>
       <button id="chat-send" disabled>发送</button>
     </div>
   </aside>
@@ -330,6 +347,57 @@
     b.className = 'badge ' + (alarm ? 'alarm' : 'ok');
   }
 
+  // 电机状态卡：payload 来自 action.motor.read / event.motor.status
+  // → {axes:[{axis,position,velocity,statusword,error,enabled,reached}], wkc, cycles}
+  var motorRows = {};   // 复用 DOM，1 s 一次的刷新不要重建节点（否则滚动/闪烁）
+  function setMotor(state) {
+    if (!state || !state.axes) return;
+    var box = el('motor-axes');
+    state.axes.forEach(function (a) {
+      var row = motorRows[a.axis];
+      if (!row || !row.parentNode) {
+        if (box.querySelector('.muted')) box.innerHTML = '';
+        row = document.createElement('div');
+        row.className = 'ax';
+        row.innerHTML =
+          '<span class="name"></span>' +
+          '<span class="cell"><span class="k">位置</span><span class="v" data-f="pos"></span></span>' +
+          '<span class="cell"><span class="k">速度</span><span class="v" data-f="vel"></span></span>' +
+          '<span class="cell"><span class="k">状态</span><span class="v" data-f="st"></span></span>';
+        motorRows[a.axis] = row;
+        box.appendChild(row);
+      }
+      var bad = a.error !== 0;
+      row.querySelector('.name').textContent = '轴 ' + a.axis;
+      row.querySelector('[data-f=pos]').textContent = a.position;
+      row.querySelector('[data-f=vel]').textContent = a.velocity;
+      var st = row.querySelector('[data-f=st]');
+      st.textContent = bad ? ('故障 0x' + a.error.toString(16).toUpperCase().padStart(4, '0'))
+                           : (a.enabled ? '使能' : '未使能');
+      st.style.color = bad ? 'var(--alarm)' : (a.enabled ? 'var(--ok)' : 'var(--muted)');
+      row.style.borderColor = bad ? 'var(--alarm)' : 'var(--border)';
+    });
+    el('motor-foot').textContent =
+      'wkc ' + (state.wkc === undefined ? '--' : state.wkc) +
+      ' · 周期 ' + (state.cycles === undefined ? '--' : state.cycles) +
+      ' · 每秒刷新（状态事件按 EA_STATUS_REPORT_MS 节流，只影响 Agent，不影响本页）';
+    motorLast = Date.now();
+  }
+
+  // motor-ecat 掉线时上面那张卡会一直显示最后一份快照，这里标出来。
+  var motorLast = 0;
+  setInterval(function () {
+    if (!motorLast) return;
+    var stale = Date.now() - motorLast > 5000;
+    var f = el('motor-foot');
+    if (stale && f.textContent.indexOf('无响应') < 0) {
+      f.textContent = '⚠️ motor-ecat 无响应（状态已停止更新）';
+      f.style.color = 'var(--alarm)';
+    } else if (!stale && f.style.color) {
+      f.style.color = '';
+    }
+  }, 2000);
+
   function send(obj) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 
   function handleControlResult(m) {
@@ -388,6 +456,18 @@
             setProc(String(m.process), !m.down);
             addEvent('进程 ' + m.process + (m.down ? ' 掉线' : ' 上线'), m.down ? 'alarm' : 'ok');
           }
+          break;
+        case 'motor':
+          setMotor(m.state);
+          break;
+        case 'temperature_read':
+          if (m.state) {
+            setTemp(m.state.value, m.state.state);
+            if (m.state.heater_on !== undefined) setHeater(m.state.heater_on);
+          }
+          break;
+        case 'task':
+          addEvent(m.text || '任务状态变化', 'ok');
           break;
         case 'reply':
           addChat(m.text || '', 'reply');

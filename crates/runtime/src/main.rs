@@ -20,6 +20,13 @@ const DEFAULT_IGNORE: &[&str] = &[
     // 高频运动状态不进决策（10 Hz 会打爆 LLM）；只有 alarm 走推理。
     event::MOTOR_STATUS,
     event::MOTOR_REACHED,
+    // 任务/进程的生命周期事件**不能**触发推理：它们是本系统自己的簿记，
+    // 喂给 LLM 会造成自激（真机实测：电机演示的 event.task.started 让 agent
+    // 又发起一次演示；开机的 event.process.up 让它顺手 start 了任务和加热器）。
+    event::TASK_STARTED,
+    event::TASK_STOPPED,
+    event::PROCESS_UP,
+    event::PROCESS_DOWN,
 ];
 const EVENT_WINDOW: usize = 20;
 const MAX_ROUNDS: u32 = 5;
@@ -122,14 +129,20 @@ fn dispatch(rt: &mut Runtime, m: &str, data: &Value) {
             }
         }
         emit_decision(rt, m, "rule", Some(&rule_id), &executed);
-        if explain {
-            explain_rule(rt, m, &rule_id, data, &executed);
-        }
+        // 不再为规则命中额外调 LLM 解释（`explain` 字段保留兼容 rules.json）：
+        // 解释改为「用户在对话里问起时才由 LLM 结合 history 回答」，
+        // 否则一次告警就要阻塞事件循环十几秒。
+        let _ = explain;
         return;
     }
 
-    // 无规则命中 → LLM 推理。
-    llm_decide(rt, m, data);
+    // ⚠️ 只有**用户在对话里提问**才走 LLM（真机教训：让所有事件都去调 LLM，
+    // 单线程运行时会被 10~30 s 一次的推理彻底堵死，网页聊天要等两分钟才响应）。
+    // 告警/温度/进程等事件仍会进 history，聊天时作为上下文一并交给模型；
+    // 确定性动作（如高温→停加热器）只走上面的规则，不消耗推理。
+    if m == event::CHAT_MESSAGE {
+        llm_decide(rt, m, data);
+    }
 }
 
 fn llm_decide(rt: &mut Runtime, m: &str, data: &Value) {
@@ -142,6 +155,13 @@ fn llm_decide(rt: &mut Runtime, m: &str, data: &Value) {
             let s = serde_json::to_string(&snap).unwrap_or_default();
             messages.push(json!({"role": "system", "content": format!("当前环境快照: {s}")}));
         }
+    }
+    // 电机状态事件被节流到 3 分钟，聊天时主动读一次最新快照，别让模型拿旧数据。
+    if let Ok(ax) = rt.client.call(action::MOTOR_READ, json!({})) {
+        messages.push(json!({
+            "role": "system",
+            "content": format!("电机实时状态: {}", serde_json::to_string(&ax).unwrap_or_default()),
+        }));
     }
     for (em, ed) in rt.history.iter().rev() {
         messages.push(json!({
@@ -231,26 +251,6 @@ fn llm_decide(rt: &mut Runtime, m: &str, data: &Value) {
     emit_decision(rt, m, "llm", None, &executed);
     if !final_text.is_empty() {
         let _ = rt.client.call(action::CHAT_REPLY, json!({"session": session, "text": final_text}));
-    }
-}
-
-fn explain_rule(rt: &mut Runtime, event_method: &str, rule_id: &str, data: &Value, executed: &[String]) {
-    let session = data.get("session").and_then(|v| v.as_str()).unwrap_or("");
-    let user = format!(
-        "事件 {event_method} 触发规则 {rule_id}，执行操作 {}。请用一句话向用户解释。",
-        executed.join(", ")
-    );
-    let req = json!({
-        "messages": [
-            {"role": "system", "content": "你用一个中文短句向用户解释系统刚才的自动操作。"},
-            {"role": "user", "content": user}
-        ],
-        "tools": []
-    });
-    if let Ok(resp) = rt.client.call_timeout(method::SYS_LLM_CHAT, req, LLM_TIMEOUT) {
-        if let Some(text) = resp.get("content").and_then(|v| v.as_str()) {
-            let _ = rt.client.call(action::CHAT_REPLY, json!({"session": session, "text": text}));
-        }
     }
 }
 
@@ -360,17 +360,31 @@ fn load_rules() -> (Vec<String>, Vec<Rule>) {
         .and_then(|t| serde_json::from_str::<Value>(&t).ok());
     match parsed {
         Some(v) => {
-            let ignore = v
+            // ⚠️ 永远并入 DEFAULT_IGNORE：rules.json 是**打包进镜像**的，
+            // 很容易比二进制旧（真机上就出现过旧文件缺 motor 项，导致 10 Hz 的
+            // event.motor.status 全走 LLM → 单线程运行时被推理堵死，
+            // 用户在网页聊天框里发指令半天没反应，对话框还被状态刷屏）。
+            let mut ignore = default_ignore;
+            for m in v
                 .get("ignore")
                 .and_then(|i| i.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or(default_ignore);
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                if !ignore.contains(&m) {
+                    ignore.push(m);
+                }
+            }
             let rules = v
                 .get("rules")
                 .and_then(|r| r.as_array())
                 .map(|a| a.iter().filter_map(parse_rule).collect())
                 .unwrap_or_else(default_rules);
-            eprintln!("[runtime] loaded rules from {path}: {} rules", rules.len());
+            eprintln!(
+                "[runtime] loaded rules from {path}: {} rules, {} ignore (内置项已并入)",
+                rules.len(),
+                ignore.len()
+            );
             (ignore, rules)
         }
         None => {

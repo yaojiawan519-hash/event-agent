@@ -5,6 +5,7 @@
 //! - 订阅温度/进程/任务事件并实时推送到浏览器。
 
 use std::collections::HashMap;
+use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -47,7 +48,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Client::connect(
             &bus_addr,
             "web",
-            &["event.temperature.*", "event.process.*", "event.task.*"],
+            &[
+                "event.temperature.*",
+                "event.process.*",
+                "event.task.*",
+                "event.motor.*",
+            ],
             &[action::CHAT_REPLY],
             &[ActionSpec {
                 method: action::CHAT_REPLY.to_string(),
@@ -72,6 +78,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus_sessions = state.sessions.clone();
     tokio::spawn(async move {
         bus_loop(bus_client, bus_sessions).await;
+    });
+
+    // 实时状态轮询：状态事件按 `EA_STATUS_REPORT_MS`（默认 3 分钟）节流，
+    // 那是对 **Agent** 的降噪；网页要看到实时位置/温度，自己按 1 s 读一次即可
+    //（`action.motor.read` / `action.temperature.read` 都只走总线，不碰 LLM）。
+    let poll_client = client.clone();
+    let poll_sessions = state.sessions.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if poll_sessions.lock().unwrap().is_empty() {
+                continue; // 没人在看就不发请求，别空转总线
+            }
+            if let Ok(v) = poll_client.call(action::MOTOR_READ, json!({})).await {
+                broadcast(&poll_sessions, &json!({"type": "motor", "state": v}).to_string());
+            }
+            if let Ok(v) = poll_client.call(action::TEMPERATURE_READ, json!({})).await {
+                broadcast(&poll_sessions, &json!({"type": "temperature_read", "state": v}).to_string());
+            }
+        }
     });
 
     let app = Router::new()
@@ -216,6 +244,36 @@ fn event_to_browser(method: &str, data: &Value) -> Option<Value> {
                 "text": format!("✅ {cn}告警解除"),
             }))
         }
+        event::MOTOR_ALARM => {
+            let kind = data.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let text = match kind {
+                "servo" => format!(
+                    "⚠️ 电机轴 {} 故障 0x{:04X}",
+                    data.get("axis").and_then(|v| v.as_u64()).unwrap_or(0),
+                    data.get("error").and_then(|v| v.as_u64()).unwrap_or(0)
+                ),
+                _ => format!(
+                    "⚠️ EtherCAT 通讯异常：wkc={} 期望 {}",
+                    data.get("wkc").and_then(|v| v.as_u64()).unwrap_or(0),
+                    data.get("expected").and_then(|v| v.as_u64()).unwrap_or(0)
+                ),
+            };
+            Some(json!({"type": "alarm", "level": "servo", "text": text}))
+        }
+        event::MOTOR_ALARM_CLEARED => {
+            Some(json!({"type": "alarm_cleared", "level": "servo", "text": "✅ 电机告警解除"}))
+        }
+        event::MOTOR_STATUS => Some(json!({"type": "motor", "state": data})),
+        event::TASK_STARTED => Some(json!({
+            "type": "task",
+            "text": format!("▶ 任务 {} 开始", data.get("task").and_then(|v| v.as_str()).unwrap_or("")),
+        })),
+        event::TASK_STOPPED => Some(json!({
+            "type": "task",
+            "text": format!("■ 任务 {} 结束（{}）",
+                data.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+                data.get("reason").and_then(|v| v.as_str()).unwrap_or("")),
+        })),
         event::PROCESS_DOWN => Some(json!({
             "type": "status",
             "process": data.get("name").cloned().unwrap_or(Value::Null),

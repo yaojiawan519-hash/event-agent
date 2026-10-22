@@ -5,7 +5,7 @@
 //! ```text
 //!   bus ──JSON-RPC/TCP──> RPC 线程（tokio，普通优先级）
 //!                          · 收 action.motor.*，只投递命令后立即应答
-//!                          · 按 10 Hz 读快照发 event.motor.status / reached / alarm
+//!                          · 250 ms 查边沿发 reached/alarm；快照按 EA_STATUS_REPORT_MS（默认 3 min）发
 //!                                │  命令环（无锁 SPSC，AtomicU64 槽）
 //!                                │  状态快照（原子字段）
 //!                          RT 线程（SCHED_FIFO 80 + 绑核 + 定向 mlock）
@@ -36,8 +36,23 @@ use tracing::{info, warn};
 const MAX_AXES: usize = 2;
 /// PDO 周期（µs）。4 ms 对齐 LinuxWasm 已验证基线。
 const CYCLE_US: u64 = 4_000;
-/// 状态事件频率：10 Hz（**不是** 250 Hz —— 否则会把总线与 runtime 打爆）。
-const STATUS_PERIOD: Duration = Duration::from_millis(100);
+/// 状态上报周期（`event.motor.status`）：默认 **3 分钟**，由环境变量
+/// `EA_STATUS_REPORT_MS` 覆盖（毫秒）。
+///
+/// 为什么这么长：这条事件会进 Agent 的决策视野，10 Hz 会把单线程 runtime 的
+/// LLM 调用彻底堵死（真机实测：网页聊天要等 2 分钟才被响应）。
+/// 网页要看实时位置，走 `action.motor.read`（web 自己按 1 s 轮询），不靠事件。
+/// 告警/到位**不受**此周期影响：它们走独立的 250 ms 边沿检测，且只在状态翻转时发一次。
+fn status_period() -> Duration {
+    let ms = std::env::var("EA_STATUS_REPORT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STATUS_REPORT_MS);
+    Duration::from_millis(ms.max(100))
+}
+
+/// 默认 3 分钟。
+const DEFAULT_STATUS_REPORT_MS: u64 = 180_000;
 /// 命令环容量（定长，无需分配）。
 const CMD_RING: usize = 64;
 /// 每个周期最多处理多少条命令，防止命令洪泛饿死 PDO 循环。
@@ -1094,19 +1109,34 @@ async fn rpc_loop(shared: Arc<Shared>, addr: String) -> Result<(), Box<dyn std::
     let client = Client::connect(&addr, "motor-ecat", &[], PROVIDES, &actions()).await?;
     info!("[rpc] 已连接总线 {addr}");
 
-    let mut tick = tokio::time::interval(STATUS_PERIOD);
+    let period = status_period();
+    info!("[rpc] 状态上报周期 = {:?}（EA_STATUS_REPORT_MS）", period);
+    // 两个节奏：
+    // - `edge`（250 ms）只管**本地边沿检测**（到位沿、告警沿）。它们本来就跟
+    //   事件数成反比：告警只在「类别+轴+错误码」变化时发一次，到位每次运动一次，
+    //   所以快速轮询也不会给总线添任何负担，却能让告警**及时**送到。
+    // - `tick`（EA_STATUS_REPORT_MS，默认 3 分钟）只发周期快照 `event.motor.status`，
+    //   它才是嫌吵的那个（进 rules.json 的 ignore）。
+    let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut edge = tokio::time::interval(Duration::from_millis(250));
+    edge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let n_axes = shared.n_axes;
+    let started = std::time::Instant::now();
     let mut last_reached = [false; MAX_AXES];
-    let mut last_alarm = false;
+    // 报警去重：**同一条报警只更新、不重复上报**。key 编码「类别+轴+错误码」，
+    // 变化才发新事件（故障码变了才算另一条报警）；恢复正常发一次 cleared。
+    let mut last_alarm_key: Option<String> = None;
 
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                // 10 Hz 状态（在 ignore 列表里，不触发推理）
+                // 周期快照（在 ignore 列表里，不触发推理）
                 let _ = client.emit(event::MOTOR_STATUS, shared.snapshot()).await;
+            }
 
+            _ = edge.tick() => {
                 // 到位沿（只在 false→true 时发一次）
                 for a in 0..n_axes {
                     let reached = shared.axes[a].reached.load(Ordering::Relaxed);
@@ -1123,22 +1153,45 @@ async fn rpc_loop(shared: Arc<Shared>, addr: String) -> Result<(), Box<dyn std::
                 let wkc = shared.wkc.load(Ordering::Relaxed);
                 let err_axis = (0..n_axes).find(|&a| shared.axes[a].error.load(Ordering::Relaxed) != 0);
                 let expected = shared.expect_wkc.load(Ordering::Relaxed);
-                // 未标定（expected==0）时只把 wkc==0 当异常，避免启动瞬间误报。
-                let alarm = wkc == 0
-                    || (expected != 0 && wkc != expected)
-                    || err_axis.is_some();
-                if alarm && !last_alarm {
-                    let payload = match err_axis {
-                        Some(a) => json!({
-                            "kind": "servo",
-                            "axis": a,
-                            "error": shared.axes[a].error.load(Ordering::Relaxed),
-                        }),
-                        None => json!({"kind": "wkc", "wkc": wkc, "expected": expected}),
-                    };
-                    let _ = client.emit(event::MOTOR_ALARM, payload).await;
+                // expected==0 = RT 还没标定出健康周期（刚启动）。这期间不发 wkc 告警，
+                // 否则每次重启 motor-ecat 都会先报一条「通讯异常」再报解除，
+                // 而 MOTOR_ALARM 是**会进 LLM 决策**的——等于每次重启白烧一次推理。
+                // 给 30 s 宽限：总线真起不来才报。
+                let bus_bad = if expected != 0 {
+                    wkc != expected
+                } else {
+                    wkc == 0 && started.elapsed() > Duration::from_secs(30)
+                };
+                let key = if err_axis.is_none() && !bus_bad {
+                    None
+                } else {
+                    Some(match err_axis {
+                        Some(a) => format!(
+                            "servo:{}:{:04X}",
+                            a,
+                            shared.axes[a].error.load(Ordering::Relaxed)
+                        ),
+                        None => format!("wkc:{wkc}:{expected}"),
+                    })
+                };
+                if key != last_alarm_key {
+                    if let Some(k) = &key {
+                        // 同 key 的重复报警不再上报（网页显示的是最新状态，够用）。
+                        let payload = match err_axis {
+                            Some(a) => json!({
+                                "kind": "servo",
+                                "axis": a,
+                                "error": shared.axes[a].error.load(Ordering::Relaxed),
+                                "key": k,
+                            }),
+                            None => json!({"kind": "wkc", "wkc": wkc, "expected": expected, "key": k}),
+                        };
+                        let _ = client.emit(event::MOTOR_ALARM, payload).await;
+                    } else if last_alarm_key.is_some() {
+                        let _ = client.emit(event::MOTOR_ALARM_CLEARED, json!({})).await;
+                    }
+                    last_alarm_key = key;
                 }
-                last_alarm = alarm;
             }
 
             incoming = client.next() => {

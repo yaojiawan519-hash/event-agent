@@ -38,12 +38,16 @@ pub mod event {
     pub const TASK_STOPPED: &str = "event.task.stopped";
     pub const RUNTIME_DECISION: &str = "event.runtime.decision";
     // —— 实时运动控制（motor-ecat，M5）——
-    /// 周期状态快照（10 Hz，**不进决策**，见 rules.json 的 ignore）。
+    /// 周期状态快照（周期由 `EA_STATUS_REPORT_MS` 决定，默认 **3 分钟**；
+    /// **不进决策**，见 rules.json 的 ignore）。
     pub const MOTOR_STATUS: &str = "event.motor.status";
     /// 某轴到达目标位置（由 RT 循环检测到 statusword bit10 上升沿后发出）。
     pub const MOTOR_REACHED: &str = "event.motor.reached";
     /// 伺服故障 / EtherCAT 工作计数异常（**进决策**）。
+    /// 同一条报警（类别+轴+错误码相同）只上报一次，不重复刷屏。
     pub const MOTOR_ALARM: &str = "event.motor.alarm";
+    /// 上述报警恢复正常（与 alarm 成对，只在状态翻转时发一次）。
+    pub const MOTOR_ALARM_CLEARED: &str = "event.motor.alarm_cleared";
 }
 
 /// 操作方法名（action.*）。

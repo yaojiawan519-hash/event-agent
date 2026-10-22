@@ -13,6 +13,9 @@ COPY crates/hw-temp crates/hw-temp
 COPY crates/web crates/web
 COPY crates/heartbeat crates/heartbeat
 COPY crates/llm-gw crates/llm-gw
+# motor-ecat 不在本镜像里（它是设备上的原生 RT 进程，见 DESIGN §8.8），
+# 但它属于同一个 cargo workspace——不拷源码 cargo 连清单都加载不了。
+COPY crates/motor-ecat crates/motor-ecat
 
 # 宿主工作区只含原生成员；一次构建全部 5 个二进制。
 # rusqlite 用 bundled 特性（自带 sqlite3），reqwest 用 rustls，无需系统库。
