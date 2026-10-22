@@ -155,18 +155,31 @@
     text-transform: uppercase; letter-spacing: .05em;
   }
 
-  /* 电机状态（网页自己 1 s 轮询 action.motor.read，不经过 LLM） */
-  #motor-axes { display: flex; flex-direction: column; gap: 6px; }
-  .ax {
-    display: grid; grid-template-columns: 44px 1fr 1fr 1fr;
-    gap: 8px; align-items: center;
-    background: #f8fafc; border: 1px solid var(--border);
-    border-radius: 10px; padding: 8px 10px; font-size: 13px;
+  /* 电机仪表盘：与温度的仪表卡对等（大号位置读数 + 四个状态格） */
+  #motor-axes { display: flex; flex-direction: column; gap: 10px; }
+  .mcard {
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; background: #fff;
   }
-  .ax .name { font-weight: 600; }
-  .ax .cell { display: flex; flex-direction: column; gap: 2px; }
-  .ax .cell .k { font-size: 11px; color: var(--muted); }
-  .ax .cell .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .mcard.alarm { border-color: var(--alarm); background: var(--alarm-soft); }
+  .mcard .mhead {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted);
+  }
+  .mcard .mhead .en { margin-left: auto; }
+  .mcard .pos {
+    font-size: 42px; font-weight: 700; line-height: 1.1;
+    font-variant-numeric: tabular-nums; margin: 2px 0 0;
+  }
+  .mcard .pos .u { font-size: 16px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .mcard .turns { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .mcard .tiles { display: flex; gap: 8px; }
+  .mcard .tile {
+    flex: 1; background: #f8fafc; border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 8px; text-align: center;
+  }
+  .mcard .tile .k { font-size: 11px; color: var(--muted); }
+  .mcard .tile .v { font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
   #motor-foot { font-size: 11px; color: var(--muted); margin-top: 6px; }
   #proc-list { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
@@ -240,6 +253,37 @@
           <div class="hint">加热器是唯一热源：开→升温、关→降温；环境只作冷源（-8..20 ℃ 正弦）。固定冷环境即触发低温告警。</div>
         </div>
       </div>
+
+      <div class="tnode open">
+        <div class="thead" data-toggle><span class="arrow">▾</span>电机控制</div>
+        <div class="tbody">
+          <div class="trow">
+            <button class="primary" id="motor-enable">使能</button>
+            <button id="motor-stop">急停</button>
+          </div>
+          <div class="trow">
+            <button class="block" id="motor-jog-plus">顺时针 1 圈（+20000）</button>
+          </div>
+          <div class="trow">
+            <button class="block" id="motor-jog-minus">逆时针 1 圈（−20000）</button>
+          </div>
+          <div class="trow">
+            <input type="number" id="motor-pos-input" step="20000" placeholder="绝对位置 counts">
+            <button class="primary" id="motor-move-abs">定位</button>
+          </div>
+          <div class="trow">
+            <input type="number" id="motor-vel-input" step="5000" value="20000" placeholder="速度 counts/s">
+            <button id="motor-set-vel">设速</button>
+          </div>
+          <div class="trow">
+            <button class="block" id="motor-demo">演示：顺 3 圈 → 逆 3 圈</button>
+          </div>
+          <div class="trow">
+            <button class="block" id="motor-home">当前位置软件置零</button>
+          </div>
+          <div class="hint">开环步进无编码器：位置是驱动器自己的计数，20000 counts = 1 圈。急停立即断使能；「演示」由 task-motor 任务进程编排。</div>
+        </div>
+      </div>
     </div>
   </aside>
 
@@ -258,7 +302,7 @@
         <div class="stat"><div class="k">在线进程</div><div class="v" id="proc-count">0</div></div>
       </div>
       <div id="alarm-banner"><span>⚠️</span><span id="alarm-banner-text"></span></div>
-      <div class="section-title">电机状态</div>
+      <div class="section-title">电机仪表盘（1 s 刷新）</div>
       <div id="motor-axes"><span class="muted">未连接</span></div>
       <div id="motor-foot"></div>
       <div class="section-title">进程状态</div>
@@ -354,28 +398,44 @@
     if (!state || !state.axes) return;
     var box = el('motor-axes');
     state.axes.forEach(function (a) {
-      var row = motorRows[a.axis];
-      if (!row || !row.parentNode) {
+      var card = motorRows[a.axis];
+      if (!card || !card.parentNode) {
         if (box.querySelector('.muted')) box.innerHTML = '';
-        row = document.createElement('div');
-        row.className = 'ax';
-        row.innerHTML =
-          '<span class="name"></span>' +
-          '<span class="cell"><span class="k">位置</span><span class="v" data-f="pos"></span></span>' +
-          '<span class="cell"><span class="k">速度</span><span class="v" data-f="vel"></span></span>' +
-          '<span class="cell"><span class="k">状态</span><span class="v" data-f="st"></span></span>';
-        motorRows[a.axis] = row;
-        box.appendChild(row);
+        card = document.createElement('div');
+        card.className = 'mcard';
+        card.innerHTML =
+          '<div class="mhead"><span class="n"></span>' +
+            '<span class="reached badge muted">待机</span>' +
+            '<span class="en badge muted"></span></div>' +
+          '<div class="pos"><span data-f="pos"></span><span class="u">counts</span></div>' +
+          '<div class="turns" data-f="turns"></div>' +
+          '<div class="tiles">' +
+            '<div class="tile"><div class="k">速度</div><div class="v" data-f="vel"></div></div>' +
+            '<div class="tile"><div class="k">故障</div><div class="v" data-f="err"></div></div>' +
+            '<div class="tile"><div class="k">状态字</div><div class="v" data-f="sw"></div></div>' +
+          '</div>';
+        motorRows[a.axis] = card;
+        box.appendChild(card);
       }
       var bad = a.error !== 0;
-      row.querySelector('.name').textContent = '轴 ' + a.axis;
-      row.querySelector('[data-f=pos]').textContent = a.position;
-      row.querySelector('[data-f=vel]').textContent = a.velocity;
-      var st = row.querySelector('[data-f=st]');
-      st.textContent = bad ? ('故障 0x' + a.error.toString(16).toUpperCase().padStart(4, '0'))
-                           : (a.enabled ? '使能' : '未使能');
-      st.style.color = bad ? 'var(--alarm)' : (a.enabled ? 'var(--ok)' : 'var(--muted)');
-      row.style.borderColor = bad ? 'var(--alarm)' : 'var(--border)';
+      card.className = 'mcard' + (bad ? ' alarm' : '');
+      card.querySelector('.n').textContent = '轴 ' + a.axis + ' · 当前位置';
+      card.querySelector('[data-f=pos]').textContent = a.position;
+      // 20000 µstep/圈（MOONS 配置值）
+      card.querySelector('[data-f=turns]').textContent =
+        (a.position >= 0 ? '' : '−') + (Math.abs(a.position) / 20000).toFixed(2) + ' 圈';
+      card.querySelector('[data-f=vel]').textContent = a.velocity;
+      var errEl = card.querySelector('[data-f=err]');
+      errEl.textContent = bad ? '0x' + a.error.toString(16).toUpperCase().padStart(4, '0') : '无';
+      errEl.style.color = bad ? 'var(--alarm)' : '';
+      card.querySelector('[data-f=sw]').textContent =
+        '0x' + (a.statusword || 0).toString(16).toUpperCase().padStart(4, '0');
+      var en = card.querySelector('.en');
+      en.textContent = bad ? '故障' : (a.enabled ? '已使能' : '未使能');
+      en.className = 'en badge ' + (bad ? 'alarm' : (a.enabled ? 'ok' : 'muted'));
+      var rc = card.querySelector('.reached');
+      rc.textContent = a.reached ? '到位' : (a.enabled ? '运动中' : '待机');
+      rc.className = 'reached badge ' + (a.reached ? 'ok' : 'muted');
     });
     el('motor-foot').textContent =
       'wkc ' + (state.wkc === undefined ? '--' : state.wkc) +
@@ -412,6 +472,13 @@
     else if (m.cmd === 'temperature.read') addEvent('当前温度 ' + (m.result.value || 0).toFixed(1) + ' ℃（' + (m.result.heater_on ? '加热中' : '未加热') + '）');
     else if (m.cmd === 'ambient.set') addEvent('环境温度固定为 ' + (m.result.ambient || 0).toFixed(1) + ' ℃', 'ok');
     else if (m.cmd === 'ambient.resume') addEvent('环境温度恢复正弦摆动', 'ok');
+    else if (m.cmd === 'motor.enable') addEvent('电机已使能', 'ok');
+    else if (m.cmd === 'motor.stop') addEvent('已急停（断使能）', 'alarm');
+    else if (m.cmd === 'motor.home') addEvent('当前位置已软件置零', 'ok');
+    else if (m.cmd === 'motor.move_rel') addEvent('点动指令已下发', 'ok');
+    else if (m.cmd === 'motor.move_abs') addEvent('定位指令已下发', 'ok');
+    else if (m.cmd === 'motor.set_velocity') addEvent('轮廓速度已下发', 'ok');
+    else if (m.cmd === 'motor.demo') addEvent('演示任务已启动（顺 3 圈 → 逆 3 圈）', 'ok');
   }
 
   function connect() {
@@ -436,14 +503,14 @@
           setTemp(m.value, m.state || 'normal');
           setHeater(m.heater_on);
           break;
+        // 告警**只**进右侧「最近事件」与顶部横幅，**不进对话框**——
+        // 对话框只承载「我发了什么 / Agent 回了什么」，状态类信息会把它冲掉。
         case 'alarm':
           setAlarm(true, m.text);
-          addChat(m.text || ('⚠️ 告警 ' + m.level), 'alarm');
           addEvent(m.text || ('告警 ' + m.level), 'alarm');
           break;
         case 'alarm_cleared':
           setAlarm(false);
-          addChat(m.text || '✅ 告警解除', 'system');
           addEvent(m.text || '告警解除', 'ok');
           break;
         case 'status':
@@ -492,6 +559,28 @@
   });
   el('read-temp').addEventListener('click', function () {
     send({ type: 'control', cmd: 'temperature.read' });
+  });
+
+  // 电机控制（都走 handler 的 control 通道 → action.motor.*，不经过 LLM）
+  el('motor-enable').addEventListener('click', function () { send({ type: 'control', cmd: 'motor.enable' }); });
+  el('motor-stop').addEventListener('click', function () { send({ type: 'control', cmd: 'motor.stop' }); });
+  el('motor-home').addEventListener('click', function () { send({ type: 'control', cmd: 'motor.home' }); });
+  el('motor-jog-plus').addEventListener('click', function () {
+    send({ type: 'control', cmd: 'motor.move_rel', delta: 20000 });
+  });
+  el('motor-jog-minus').addEventListener('click', function () {
+    send({ type: 'control', cmd: 'motor.move_rel', delta: -20000 });
+  });
+  el('motor-move-abs').addEventListener('click', function () {
+    var p = parseInt(el('motor-pos-input').value, 10);
+    if (!isNaN(p)) send({ type: 'control', cmd: 'motor.move_abs', position: p });
+  });
+  el('motor-set-vel').addEventListener('click', function () {
+    var v = parseInt(el('motor-vel-input').value, 10);
+    if (!isNaN(v)) send({ type: 'control', cmd: 'motor.set_velocity', velocity: v });
+  });
+  el('motor-demo').addEventListener('click', function () {
+    send({ type: 'control', cmd: 'motor.demo', turns: 3 });
   });
 
   // 树节点展开/折叠

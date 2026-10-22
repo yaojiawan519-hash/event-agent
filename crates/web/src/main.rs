@@ -113,8 +113,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index() -> impl axum::response::IntoResponse {
+    // no-store：页面是 `include_str!` 编进二进制的，改版后浏览器不刷新就会一直跑旧 JS
+    //（真机踩过：加了电机仪表盘，用户看到的还是老页面）。
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store, must-revalidate")],
+        Html(INDEX_HTML),
+    )
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(st): State<WebState>) -> axum::response::Response {
@@ -180,6 +185,32 @@ async fn handle_control(st: &WebState, session: &str, v: &Value) {
         }
         "ambient.resume" => (action::TEMPERATURE_SET_AMBIENT, json!({"value": 0.0, "hold": false})),
         "temperature.read" => (action::TEMPERATURE_READ, json!({})),
+        // —— 电机（motor-ecat 原生 RT 进程）——
+        // 这些是**投递式**动作：立即返回 {"accepted":true}，真实位置靠 1 s 轮询刷新。
+        "motor.read" => (action::MOTOR_READ, json!({})),
+        "motor.enable" => (action::MOTOR_ENABLE, json!({})),
+        "motor.stop" => (action::MOTOR_STOP, json!({})),
+        "motor.home" => (action::MOTOR_HOME, json!({})),
+        "motor.move_rel" => {
+            let delta = v.get("delta").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            (action::MOTOR_MOVE_REL, json!({"axis": 0, "delta": delta}))
+        }
+        "motor.move_abs" => {
+            let position = v.get("position").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            (action::MOTOR_MOVE_ABS, json!({"axis": 0, "position": position}))
+        }
+        "motor.set_velocity" => {
+            let velocity = v.get("velocity").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            (action::MOTOR_SET_VELOCITY, json!({"axis": 0, "velocity": velocity}))
+        }
+        // 演示任务走 task-motor（Wasm 访客），不是 motor-ecat 的动作。
+        "motor.demo" => {
+            let turns = v.get("turns").and_then(|x| x.as_f64()).unwrap_or(3.0);
+            (
+                action::TASK_MOTOR_DEMO,
+                json!({"axis": 0, "turns_cw": turns, "turns_ccw": turns}),
+            )
+        }
         _ => return,
     };
     let payload = match st.client.call(m, data).await {
